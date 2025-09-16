@@ -98,6 +98,8 @@ def convert_to_serializable(obj):
         return obj.tolist()
     elif isinstance(obj, pd.Timestamp):
         return obj.isoformat()
+    elif isinstance(obj, pd.DataFrame):
+        return obj.to_dict(orient='records')
     else:
         return obj
 
