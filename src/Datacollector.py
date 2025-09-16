@@ -105,18 +105,29 @@ def calculate_liquidity_metrics(transactions: pd.DataFrame) -> Dict[str, Any]:
             'Current Ratio': 0.0,
             'Quick Ratio': 0.0,
             'Cash Ratio': 0.0,
-            'status': 'No or negative liabilities found in the dataset. Ratios set to 0.'
+            'status': 'No or negative liabilities found in the dataset. Ratios set to 0.',
+            'recommendation': 'Verify dataset for liability transactions or reduce asset exposure to balance liquidity.'
         }
     
     current_ratio = round(current_assets / current_liabilities, 2)
     quick_ratio = round((current_assets - inventory) / current_liabilities, 2)
     cash_ratio = round(cash / current_liabilities, 2)
     
+    # Генерация рекомендации на основе ликвидности
+    recommendation = "Liquidity is stable."
+    if current_ratio < 1.0:
+        recommendation = "Increase current assets or reduce liabilities to improve Current Ratio."
+    elif quick_ratio < 0.8:
+        recommendation = "Reduce inventory or increase liquid assets to improve Quick Ratio."
+    elif cash_ratio < 0.5:
+        recommendation = "Boost cash reserves to improve Cash Ratio and liquidity buffer."
+    
     return {
         'Current Ratio': current_ratio,
         'Quick Ratio': quick_ratio,
         'Cash Ratio': cash_ratio,
-        'status': 'Success'
+        'status': 'Success',
+        'recommendation': recommendation
     }
 
 # Интеграция: Пример end-to-end сбора (для теста/демо)
@@ -132,14 +143,25 @@ def collect_integrated_data(start_date: str, end_date: str, account_type: str = 
     usd_rate = rates.get('USD', 1.0)
     transactions['USD_Equivalent'] = transactions['Transaction Amount'] / usd_rate
     
+    total_cash_flow = round(transactions['Cash Flow'].sum(), 2)
+    total_transactions = len(transactions)
+    
+    # Генерация рекомендации для данных
+    recommendation = "Financial position is stable."
+    if total_cash_flow < 0:
+        recommendation = "Address negative cash flow by reducing expenses or increasing revenue."
+    elif total_transactions < 10:
+        recommendation = "Limited transaction data; consider expanding dataset for better insights."
+    
     data = {
         'date_range': {'start': start_date, 'end': end_date},
         'currency_rates': rates,
         'transactions': transactions.to_dict('records'),  # JSON-serializable
         'summary': {
-            'total_transactions': len(transactions),
-            'total_cash_flow': round(transactions['Cash Flow'].sum(), 2),
-            'avg_profit_margin': round(transactions['Profit Margin'].mean(), 2)
+            'total_transactions': total_transactions,
+            'total_cash_flow': total_cash_flow,
+            'avg_profit_margin': round(transactions['Profit Margin'].mean(), 2),
+            'recommendation': recommendation
         }
     }
     # Добавляем метрики ликвидности в summary

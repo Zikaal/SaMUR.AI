@@ -92,20 +92,33 @@ def train_recommendation_model(transactions: pd.DataFrame) -> DecisionTreeClassi
     return model
 
 # 4. Измерьте метрики
-def evaluate_models(prophet_model: Prophet, transactions: pd.DataFrame, rec_model: DecisionTreeClassifier) -> Dict[str, float]:
+def evaluate_models(prophet_model: Prophet, transactions: pd.DataFrame, rec_model: DecisionTreeClassifier) -> Dict[str, Any]:
     """
     Оценивает точность моделей (MAE для Prophet, F1 для Decision Tree).
+    Возвращает метрики и рекомендацию.
     """
     future = prophet_model.make_future_dataframe(periods=30)
     last_usd_rate = transactions.groupby('Date').agg({'USD_Equivalent': 'mean'}).iloc[-1]['USD_Equivalent']
     future['usd_rate'] = last_usd_rate
     forecast = prophet_model.predict(future)
     true_values = transactions.groupby('Date').agg({'Cash Flow': 'sum'}).reindex(future['ds']).fillna(0)['Cash Flow']
-    mae = mean_absolute_error(true_values[-30:], forecast['yhat'][-30:])
+    mae = round(mean_absolute_error(true_values[-30:], forecast['yhat'][-30:]), 2)
     X_test = transactions[['Debt-to-Equity Ratio', 'Profit Margin', 'Transaction Amount']].fillna(0)
     y_pred = rec_model.predict(X_test)
-    f1 = f1_score((transactions['Transaction Outcome'] == 1).astype(int), y_pred)
-    return {'MAE (Prophet)': mae, 'F1-Score (Recommendations)': f1}
+    f1 = round(f1_score((transactions['Transaction Outcome'] == 1).astype(int), y_pred), 2)
+    
+    # Генерация рекомендации на основе метрик моделей
+    recommendation = "Model performance is adequate."
+    if mae > 1000:
+        recommendation = "Improve forecasting model accuracy by adding more features or data."
+    elif f1 < 0.7:
+        recommendation = "Enhance recommendation model by tuning parameters or increasing training data."
+    
+    return {
+        'MAE (Prophet)': mae,
+        'F1-Score (Recommendations)': f1,
+        'recommendation': recommendation
+    }
 
 # Вспомогательная функция для сериализации
 def convert_to_serializable(obj):
@@ -227,6 +240,17 @@ def get_what_if_scenarios():
                                              currency_growth, currency_std, 
                                              delay_factor, purchase_shift_days, 
                                              scenario_type='all')
+        mean_cash_flow = round(sim_results.mean(), 2)
+        ci_low = round(sim_results.quantile(0.025), 2)
+        ci_high = round(sim_results.quantile(0.975), 2)
+        
+        # Генерация рекомендации на основе сценариев
+        recommendation = "Scenario impacts are within acceptable range."
+        if mean_cash_flow < 0:
+            recommendation = "Mitigate combined risks (currency, delays, schedule shifts) to avoid negative cash flow."
+        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5:
+            recommendation = "High variability in scenarios; implement risk management strategies."
+        
         scenarios = {
             'scenarios': sim_results.tolist(),
             'parameters': {
@@ -236,9 +260,10 @@ def get_what_if_scenarios():
                 'purchase_shift_days': purchase_shift_days
             },
             'summary': {
-                'mean_cash_flow': round(sim_results.mean(), 2),
-                'ci_low': round(sim_results.quantile(0.025), 2),
-                'ci_high': round(sim_results.quantile(0.975), 2)
+                'mean_cash_flow': mean_cash_flow,
+                'ci_low': ci_low,
+                'ci_high': ci_high,
+                'recommendation': recommendation
             }
         }
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
@@ -265,6 +290,17 @@ def get_currency_growth_scenario():
         sim_results = monte_carlo_simulation(transactions, num_simulations, 
                                              currency_growth, currency_std, 
                                              scenario_type='currency_growth')
+        mean_cash_flow = round(sim_results.mean(), 2)
+        ci_low = round(sim_results.quantile(0.025), 2)
+        ci_high = round(sim_results.quantile(0.975), 2)
+        
+        # Генерация рекомендации
+        recommendation = "Currency growth impact is manageable."
+        if mean_cash_flow < 0:
+            recommendation = "Hedge against currency fluctuations to mitigate negative cash flow impact."
+        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5:
+            recommendation = "High uncertainty in currency growth; consider currency risk hedging."
+        
         scenarios = {
             'scenarios': sim_results.tolist(),
             'parameters': {
@@ -272,9 +308,10 @@ def get_currency_growth_scenario():
                 'currency_std': currency_std
             },
             'summary': {
-                'mean_cash_flow': round(sim_results.mean(), 2),
-                'ci_low': round(sim_results.quantile(0.025), 2),
-                'ci_high': round(sim_results.quantile(0.975), 2)
+                'mean_cash_flow': mean_cash_flow,
+                'ci_low': ci_low,
+                'ci_high': ci_high,
+                'recommendation': recommendation
             }
         }
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
@@ -300,15 +337,27 @@ def get_payment_delay_scenario():
         sim_results = monte_carlo_simulation(transactions, num_simulations, 
                                              delay_factor=delay_factor, 
                                              scenario_type='payment_delay')
+        mean_cash_flow = round(sim_results.mean(), 2)
+        ci_low = round(sim_results.quantile(0.025), 2)
+        ci_high = round(sim_results.quantile(0.975), 2)
+        
+        # Генерация рекомендации
+        recommendation = "Payment delay impact is manageable."
+        if mean_cash_flow < 0:
+            recommendation = "Improve payment collection processes to minimize delay impacts."
+        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5:
+            recommendation = "High variability in payment delays; establish stricter payment terms."
+        
         scenarios = {
             'scenarios': sim_results.tolist(),
             'parameters': {
                 'delay_factor': delay_factor
             },
             'summary': {
-                'mean_cash_flow': round(sim_results.mean(), 2),
-                'ci_low': round(sim_results.quantile(0.025), 2),
-                'ci_high': round(sim_results.quantile(0.975), 2)
+                'mean_cash_flow': mean_cash_flow,
+                'ci_low': ci_low,
+                'ci_high': ci_high,
+                'recommendation': recommendation
             }
         }
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
@@ -334,15 +383,27 @@ def get_purchase_schedule_scenario():
         sim_results = monte_carlo_simulation(transactions, num_simulations, 
                                              purchase_shift_days=purchase_shift_days, 
                                              scenario_type='purchase_schedule')
+        mean_cash_flow = round(sim_results.mean(), 2)
+        ci_low = round(sim_results.quantile(0.025), 2)
+        ci_high = round(sim_results.quantile(0.975), 2)
+        
+        # Генерация рекомендации
+        recommendation = "Purchase schedule changes are manageable."
+        if mean_cash_flow < 0:
+            recommendation = "Optimize purchase schedule to avoid negative cash flow impacts."
+        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5:
+            recommendation = "High variability in purchase schedule shifts; stabilize procurement planning."
+        
         scenarios = {
             'scenarios': sim_results.tolist(),
             'parameters': {
                 'purchase_shift_days': purchase_shift_days
             },
             'summary': {
-                'mean_cash_flow': round(sim_results.mean(), 2),
-                'ci_low': round(sim_results.quantile(0.025), 2),
-                'ci_high': round(sim_results.quantile(0.975), 2)
+                'mean_cash_flow': mean_cash_flow,
+                'ci_low': ci_low,
+                'ci_high': ci_high,
+                'recommendation': recommendation
             }
         }
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
