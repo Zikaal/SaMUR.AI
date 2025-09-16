@@ -87,6 +87,20 @@ def evaluate_models(prophet_model: Prophet, transactions: pd.DataFrame, rec_mode
     f1 = f1_score((transactions['Transaction Outcome'] == 1).astype(int), y_pred)
     return {'MAE (Prophet)': mae, 'F1-Score (Recommendations)': f1}
 
+# Вспомогательная функция для сериализации
+def convert_to_serializable(obj):
+    """Преобразует NumPy-типы в стандартные Python-типы."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    else:
+        return obj
+
 # Эндпоинты API
 @app.route('/api/data', methods=['GET'])
 def get_data():
@@ -99,7 +113,9 @@ def get_data():
     
     try:
         data = collect_integrated_data(start, end, account_type)
-        return jsonify(data)
+        # Преобразование всех значений в сериализуемые типы
+        serialized_data = json.loads(json.dumps(data, default=convert_to_serializable))
+        return jsonify(serialized_data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -122,7 +138,9 @@ def get_metrics():
         metrics['Monte_Carlo_Mean'] = sim_results.mean()
         metrics['Monte_Carlo_CI_Low'] = sim_results.quantile(0.025)
         metrics['Monte_Carlo_CI_High'] = sim_results.quantile(0.975)
-        return jsonify(metrics)
+        # Преобразование метрик в сериализуемые типы
+        serialized_metrics = json.loads(json.dumps(metrics, default=convert_to_serializable))
+        return jsonify(serialized_metrics)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
