@@ -1,3 +1,5 @@
+# ml_components.py
+
 import pandas as pd
 import numpy as np
 from prophet import Prophet
@@ -9,12 +11,13 @@ import os
 import sys
 from flask import Flask, request, jsonify
 from typing import Dict, Any
+from datetime import datetime, timedelta
 
 # Добавляем src в sys.path, если запускаем из корня
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 # Импорт функции из Datacollector.py
-from Datacollector import collect_integrated_data
+from Datacollector import collect_integrated_data, calculate_liquidity_metrics
 
 # Путь к данным
 DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
@@ -46,18 +49,37 @@ def train_prophet_model(transactions: pd.DataFrame) -> Prophet:
     model.fit(df_prophet)
     return model
 
-# 2. Сценарии "what-if" (Monte Carlo с уменьшенным шумом)
-def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 2000) -> pd.Series:
+# 2. Сценарии "what-if" (Monte Carlo с уменьшенным шумом и расширенными параметрами)
+def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 2000, 
+                           currency_growth: float = 0.1, currency_std: float = 0.01, 
+                           delay_factor: float = 0.05, purchase_shift_days: int = 0,
+                           scenario_type: str = 'all') -> pd.Series:
     """
-    Симулирует сценарии роста курсов и задержек платежей с уменьшенным шумом.
+    Симулирует сценарии "что если" с учётом роста курса, задержки платежей и сдвига графика закупок.
+    scenario_type: 'all', 'currency_growth', 'payment_delay', 'purchase_schedule'
     """
     results = []
     usd_rate = transactions['USD_Equivalent'].mean()
     for _ in range(num_simulations):
-        simulated_rate = usd_rate * (1 + np.random.normal(0.1, 0.01))
-        delay_factor = np.random.uniform(0.95, 1.05)
-        sim_cash_flow = transactions['Cash Flow'] * delay_factor / simulated_rate
-        results.append(sim_cash_flow.sum())
+        sim_transactions = transactions.copy()
+        if scenario_type in ['all', 'currency_growth']:
+            # Рост курса
+            simulated_rate = usd_rate * (1 + np.random.normal(currency_growth, currency_std))
+            sim_transactions['USD_Equivalent'] = sim_transactions['Transaction Amount'] / simulated_rate
+            sim_transactions['Cash Flow'] /= simulated_rate  # Корректировка Cash Flow на новый курс
+        if scenario_type in ['all', 'payment_delay']:
+            # Задержка платежа (множитель + сдвиг дат)
+            sim_transactions['Cash Flow'] *= np.random.uniform(1 - delay_factor, 1 + delay_factor)
+            delay_days = np.random.randint(0, int(delay_factor * 30))  # Задержка до 30 дней
+            sim_transactions['Date'] += pd.Timedelta(days=delay_days)
+        if scenario_type in ['all', 'purchase_schedule']:
+            # Сдвиг графика закупок
+            purchase_mask = sim_transactions['Account Type'].str.contains('Purchase|Procurement', case=False, na=False)
+            shift_days = np.random.randint(-purchase_shift_days, purchase_shift_days)
+            sim_transactions.loc[purchase_mask, 'Date'] += pd.Timedelta(days=shift_days)
+        # Агрегация по датам и суммирование Cash Flow
+        sim_cash_flow = sim_transactions.groupby('Date')['Cash Flow'].sum().sum()
+        results.append(sim_cash_flow)
     return pd.Series(results)
 
 # 3. Рекомендации (Decision Tree)
@@ -104,6 +126,8 @@ def convert_to_serializable(obj):
         return obj
 
 # Эндпоинты API
+
+# Эндпоинт для получения данных
 @app.route('/api/data', methods=['GET'])
 def get_data():
     start = request.args.get('start')
@@ -121,6 +145,7 @@ def get_data():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# Эндпоинт для получения метрик моделей
 @app.route('/api/metrics', methods=['GET'])
 def get_metrics():
     start = request.args.get('start')
@@ -135,14 +160,195 @@ def get_metrics():
         transactions = pd.DataFrame(data['transactions'])
         prophet_model = train_prophet_model(transactions)
         rec_model = train_recommendation_model(transactions)
-        sim_results = monte_carlo_simulation(transactions)
         metrics = evaluate_models(prophet_model, transactions, rec_model)
-        metrics['Monte_Carlo_Mean'] = sim_results.mean()
-        metrics['Monte_Carlo_CI_Low'] = sim_results.quantile(0.025)
-        metrics['Monte_Carlo_CI_High'] = sim_results.quantile(0.975)
         # Преобразование метрик в сериализуемые типы
         serialized_metrics = json.loads(json.dumps(metrics, default=convert_to_serializable))
         return jsonify(serialized_metrics)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Эндпоинты для отчётов по ликвидности
+
+# Общий отчёт по ликвидности
+@app.route('/api/liquidity', methods=['GET'])
+def get_liquidity_report():
+    start = request.args.get('start')
+    end = request.args.get('end')
+    account_type = request.args.get('account_type')
+    
+    if not start or not end:
+        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
+    
+    try:
+        data = collect_integrated_data(start, end, account_type)
+        transactions = pd.DataFrame(data['transactions'])
+        liquidity_metrics = calculate_liquidity_metrics(transactions)
+        serialized_metrics = json.loads(json.dumps(liquidity_metrics, default=convert_to_serializable))
+        return jsonify(serialized_metrics)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Отчёт по ликвидности в реальном времени (последние 24 часа)
+@app.route('/api/liquidity/real-time', methods=['GET'])
+def get_real_time_liquidity():
+    end = datetime.now().strftime('%Y-%m-%d')
+    start = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+    account_type = request.args.get('account_type')
+    
+    try:
+        data = collect_integrated_data(start, end, account_type, real_time=True)
+        transactions = pd.DataFrame(data['transactions'])
+        liquidity_metrics = calculate_liquidity_metrics(transactions)
+        liquidity_metrics['timestamp'] = datetime.now().isoformat()
+        serialized_metrics = json.loads(json.dumps(liquidity_metrics, default=convert_to_serializable))
+        return jsonify(serialized_metrics)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Эндпоинты для сценариев "что если"
+
+# Общий сценарий "что если"
+@app.route('/api/what-if', methods=['GET'])
+def get_what_if_scenarios():
+    start = request.args.get('start')
+    end = request.args.get('end')
+    account_type = request.args.get('account_type')
+    currency_growth = float(request.args.get('currency_growth', 0.1))
+    currency_std = float(request.args.get('currency_std', 0.01))
+    delay_factor = float(request.args.get('delay_factor', 0.05))
+    purchase_shift_days = int(request.args.get('purchase_shift_days', 0))
+    num_simulations = int(request.args.get('num_simulations', 2000))
+    
+    if not start or not end:
+        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
+    
+    try:
+        data = collect_integrated_data(start, end, account_type)
+        transactions = pd.DataFrame(data['transactions'])
+        sim_results = monte_carlo_simulation(transactions, num_simulations, 
+                                             currency_growth, currency_std, 
+                                             delay_factor, purchase_shift_days, 
+                                             scenario_type='all')
+        scenarios = {
+            'scenarios': sim_results.tolist(),
+            'parameters': {
+                'currency_growth': currency_growth,
+                'currency_std': currency_std,
+                'delay_factor': delay_factor,
+                'purchase_shift_days': purchase_shift_days
+            },
+            'summary': {
+                'mean_cash_flow': sim_results.mean(),
+                'ci_low': sim_results.quantile(0.025),
+                'ci_high': sim_results.quantile(0.975)
+            }
+        }
+        serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
+        return jsonify(serialized_scenarios)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Сценарий "рост курса валют"
+@app.route('/api/what-if/currency-growth', methods=['GET'])
+def get_currency_growth_scenario():
+    start = request.args.get('start')
+    end = request.args.get('end')
+    account_type = request.args.get('account_type')
+    currency_growth = float(request.args.get('currency_growth', 0.1))
+    currency_std = float(request.args.get('currency_std', 0.01))
+    num_simulations = int(request.args.get('num_simulations', 2000))
+    
+    if not start or not end:
+        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
+    
+    try:
+        data = collect_integrated_data(start, end, account_type)
+        transactions = pd.DataFrame(data['transactions'])
+        sim_results = monte_carlo_simulation(transactions, num_simulations, 
+                                             currency_growth, currency_std, 
+                                             scenario_type='currency_growth')
+        scenarios = {
+            'scenarios': sim_results.tolist(),
+            'parameters': {
+                'currency_growth': currency_growth,
+                'currency_std': currency_std
+            },
+            'summary': {
+                'mean_cash_flow': sim_results.mean(),
+                'ci_low': sim_results.quantile(0.025),
+                'ci_high': sim_results.quantile(0.975)
+            }
+        }
+        serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
+        return jsonify(serialized_scenarios)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Сценарий "задержка платежа"
+@app.route('/api/what-if/payment-delay', methods=['GET'])
+def get_payment_delay_scenario():
+    start = request.args.get('start')
+    end = request.args.get('end')
+    account_type = request.args.get('account_type')
+    delay_factor = float(request.args.get('delay_factor', 0.05))
+    num_simulations = int(request.args.get('num_simulations', 2000))
+    
+    if not start or not end:
+        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
+    
+    try:
+        data = collect_integrated_data(start, end, account_type)
+        transactions = pd.DataFrame(data['transactions'])
+        sim_results = monte_carlo_simulation(transactions, num_simulations, 
+                                             delay_factor=delay_factor, 
+                                             scenario_type='payment_delay')
+        scenarios = {
+            'scenarios': sim_results.tolist(),
+            'parameters': {
+                'delay_factor': delay_factor
+            },
+            'summary': {
+                'mean_cash_flow': sim_results.mean(),
+                'ci_low': sim_results.quantile(0.025),
+                'ci_high': sim_results.quantile(0.975)
+            }
+        }
+        serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
+        return jsonify(serialized_scenarios)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Сценарий "изменение графика закупок"
+@app.route('/api/what-if/purchase-schedule', methods=['GET'])
+def get_purchase_schedule_scenario():
+    start = request.args.get('start')
+    end = request.args.get('end')
+    account_type = request.args.get('account_type')
+    purchase_shift_days = int(request.args.get('purchase_shift_days', 0))
+    num_simulations = int(request.args.get('num_simulations', 2000))
+    
+    if not start or not end:
+        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
+    
+    try:
+        data = collect_integrated_data(start, end, account_type)
+        transactions = pd.DataFrame(data['transactions'])
+        sim_results = monte_carlo_simulation(transactions, num_simulations, 
+                                             purchase_shift_days=purchase_shift_days, 
+                                             scenario_type='purchase_schedule')
+        scenarios = {
+            'scenarios': sim_results.tolist(),
+            'parameters': {
+                'purchase_shift_days': purchase_shift_days
+            },
+            'summary': {
+                'mean_cash_flow': sim_results.mean(),
+                'ci_low': sim_results.quantile(0.025),
+                'ci_high': sim_results.quantile(0.975)
+            }
+        }
+        serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
+        return jsonify(serialized_scenarios)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

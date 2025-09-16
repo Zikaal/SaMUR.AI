@@ -2,7 +2,7 @@ import requests
 import pandas as pd
 import xml.etree.ElementTree as ET
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Any
 import json
 import os
@@ -38,15 +38,18 @@ def get_currency_rates(date: str = None) -> Dict[str, float]:
     return {code: rates.get(code, 0) for code in major_codes}
 
 # Tool 2: Загрузка и обработка транзакций из датасета (mock для банков/платежей)
-def get_transactions(start_date: str, end_date: str, account_type: str = None, handle_noisy: bool = True) -> pd.DataFrame:
+def get_transactions(start_date: str, end_date: str, account_type: str = None, 
+                     handle_noisy: bool = True, real_time: bool = False) -> pd.DataFrame:
     """
     Загружает реальные транзакции из CSV-датасета.
     Фильтрует по дате и типу аккаунта.
     Обработка noisy: заполняет missing (median), добавляет ~5% gaussian noise для теста.
+    real_time: Если True, использует последние 24 часа.
     :param start_date: YYYY-MM-DD
     :param end_date: YYYY-MM-DD
     :param account_type: 'Revenue', 'Expense', etc.
     :param handle_noisy: Включить обработку dirty data.
+    :param real_time: Включить режим реального времени.
     :return: DataFrame с данными.
     """
     # Загружаем датасет из указанной папки
@@ -57,6 +60,10 @@ def get_transactions(start_date: str, end_date: str, account_type: str = None, h
     
     # Конверт Date в datetime
     df['Date'] = pd.to_datetime(df['Date'])
+    
+    if real_time:
+        end_date = datetime.now().strftime('%Y-%m-%d')
+        start_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     
     # Фильтр по дате
     mask_date = (df['Date'] >= start_date) & (df['Date'] <= end_date)
@@ -79,14 +86,35 @@ def get_transactions(start_date: str, end_date: str, account_type: str = None, h
     
     return df
 
+# Расчёт метрик ликвидности
+def calculate_liquidity_metrics(transactions: pd.DataFrame) -> Dict[str, float]:
+    """
+    Рассчитывает метрики ликвидности на основе транзакций.
+    Предполагаем, что типы аккаунтов включают 'Asset', 'Liability', 'Cash', 'Inventory' и т.д.
+    """
+    current_assets = transactions[transactions['Account Type'].str.contains('Asset', case=False, na=False)]['Transaction Amount'].sum()
+    current_liabilities = transactions[transactions['Account Type'].str.contains('Liability', case=False, na=False)]['Transaction Amount'].sum()
+    cash = transactions[transactions['Account Type'].str.contains('Cash', case=False, na=False)]['Transaction Amount'].sum()
+    inventory = transactions[transactions['Account Type'].str.contains('Inventory', case=False, na=False)]['Transaction Amount'].sum()
+    
+    current_ratio = current_assets / current_liabilities if current_liabilities != 0 else float('inf')
+    quick_ratio = (current_assets - inventory) / current_liabilities if current_liabilities != 0 else float('inf')
+    cash_ratio = cash / current_liabilities if current_liabilities != 0 else float('inf')
+    
+    return {
+        'Current Ratio': current_ratio,
+        'Quick Ratio': quick_ratio,
+        'Cash Ratio': cash_ratio
+    }
+
 # Интеграция: Пример end-to-end сбора (для теста/демо)
-def collect_integrated_data(start_date: str, end_date: str, account_type: str = None) -> Dict[str, Any]:
+def collect_integrated_data(start_date: str, end_date: str, account_type: str = None, real_time: bool = False) -> Dict[str, Any]:
     """
     Комбинирует курсы и транзакции в один JSON для агента/ERP.
     Готово для REST: return как response.json().
     """
     rates = get_currency_rates()
-    transactions = get_transactions(start_date, end_date, account_type, handle_noisy=True)  # Передаем handle_noisy
+    transactions = get_transactions(start_date, end_date, account_type, handle_noisy=True, real_time=real_time)
     
     # Простая интеграция: добавляем колонку с курсом USD к транзакциям (предполагаем все в RUB, конверт если нужно)
     usd_rate = rates.get('USD', 1.0)
@@ -102,6 +130,8 @@ def collect_integrated_data(start_date: str, end_date: str, account_type: str = 
             'avg_profit_margin': transactions['Profit Margin'].mean()
         }
     }
+    # Добавляем метрики ликвидности в summary
+    data['summary'].update(calculate_liquidity_metrics(transactions))
     return data
 
 # Тест на noisy data (без вывода сэмплов — только метрики)
