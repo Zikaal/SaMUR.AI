@@ -8,7 +8,7 @@ import json
 import os
 
 # Указываем абсолютный путь к папке с данными
-DATA_PATH = r"D:\User\Documents\shai.pro\data"
+DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
 
 # Tool 1: Фетч курсов валют из ЦБ РФ (реальный API)
 def get_currency_rates(date: str = None) -> Dict[str, float]:

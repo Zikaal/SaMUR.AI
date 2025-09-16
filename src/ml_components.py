@@ -17,7 +17,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from Datacollector import collect_integrated_data
 
 # Путь к данным
-DATA_PATH = r"D:\User\Documents\shai.pro\data"
+DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
 
 app = Flask(__name__)
 
