@@ -1,5 +1,3 @@
-# ml_components.py
-
 import pandas as pd
 import numpy as np
 from prophet import Prophet
@@ -238,9 +236,9 @@ def get_what_if_scenarios():
                 'purchase_shift_days': purchase_shift_days
             },
             'summary': {
-                'mean_cash_flow': sim_results.mean(),
-                'ci_low': sim_results.quantile(0.025),
-                'ci_high': sim_results.quantile(0.975)
+                'mean_cash_flow': round(sim_results.mean(), 2),
+                'ci_low': round(sim_results.quantile(0.025), 2),
+                'ci_high': round(sim_results.quantile(0.975), 2)
             }
         }
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
@@ -274,9 +272,9 @@ def get_currency_growth_scenario():
                 'currency_std': currency_std
             },
             'summary': {
-                'mean_cash_flow': sim_results.mean(),
-                'ci_low': sim_results.quantile(0.025),
-                'ci_high': sim_results.quantile(0.975)
+                'mean_cash_flow': round(sim_results.mean(), 2),
+                'ci_low': round(sim_results.quantile(0.025), 2),
+                'ci_high': round(sim_results.quantile(0.975), 2)
             }
         }
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
@@ -308,9 +306,9 @@ def get_payment_delay_scenario():
                 'delay_factor': delay_factor
             },
             'summary': {
-                'mean_cash_flow': sim_results.mean(),
-                'ci_low': sim_results.quantile(0.025),
-                'ci_high': sim_results.quantile(0.975)
+                'mean_cash_flow': round(sim_results.mean(), 2),
+                'ci_low': round(sim_results.quantile(0.025), 2),
+                'ci_high': round(sim_results.quantile(0.975), 2)
             }
         }
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
@@ -342,9 +340,9 @@ def get_purchase_schedule_scenario():
                 'purchase_shift_days': purchase_shift_days
             },
             'summary': {
-                'mean_cash_flow': sim_results.mean(),
-                'ci_low': sim_results.quantile(0.025),
-                'ci_high': sim_results.quantile(0.975)
+                'mean_cash_flow': round(sim_results.mean(), 2),
+                'ci_low': round(sim_results.quantile(0.025), 2),
+                'ci_high': round(sim_results.quantile(0.975), 2)
             }
         }
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))

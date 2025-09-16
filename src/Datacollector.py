@@ -87,9 +87,11 @@ def get_transactions(start_date: str, end_date: str, account_type: str = None,
     return df
 
 # Расчёт метрик ликвидности
-def calculate_liquidity_metrics(transactions: pd.DataFrame) -> Dict[str, float]:
+def calculate_liquidity_metrics(transactions: pd.DataFrame) -> Dict[str, Any]:
     """
     Рассчитывает метрики ликвидности на основе транзакций.
+    Округляет значения до 2 знаков после запятой для точности.
+    Возвращает 0 вместо Infinity при отсутствии или отрицательных обязательствах и добавляет статус.
     Предполагаем, что типы аккаунтов включают 'Asset', 'Liability', 'Cash', 'Inventory' и т.д.
     """
     current_assets = transactions[transactions['Account Type'].str.contains('Asset', case=False, na=False)]['Transaction Amount'].sum()
@@ -97,14 +99,24 @@ def calculate_liquidity_metrics(transactions: pd.DataFrame) -> Dict[str, float]:
     cash = transactions[transactions['Account Type'].str.contains('Cash', case=False, na=False)]['Transaction Amount'].sum()
     inventory = transactions[transactions['Account Type'].str.contains('Inventory', case=False, na=False)]['Transaction Amount'].sum()
     
-    current_ratio = current_assets / current_liabilities if current_liabilities != 0 else float('inf')
-    quick_ratio = (current_assets - inventory) / current_liabilities if current_liabilities != 0 else float('inf')
-    cash_ratio = cash / current_liabilities if current_liabilities != 0 else float('inf')
+    # Проверяем наличие обязательств
+    if current_liabilities <= 0:
+        return {
+            'Current Ratio': 0.0,
+            'Quick Ratio': 0.0,
+            'Cash Ratio': 0.0,
+            'status': 'No or negative liabilities found in the dataset. Ratios set to 0.'
+        }
+    
+    current_ratio = round(current_assets / current_liabilities, 2)
+    quick_ratio = round((current_assets - inventory) / current_liabilities, 2)
+    cash_ratio = round(cash / current_liabilities, 2)
     
     return {
         'Current Ratio': current_ratio,
         'Quick Ratio': quick_ratio,
-        'Cash Ratio': cash_ratio
+        'Cash Ratio': cash_ratio,
+        'status': 'Success'
     }
 
 # Интеграция: Пример end-to-end сбора (для теста/демо)
@@ -126,8 +138,8 @@ def collect_integrated_data(start_date: str, end_date: str, account_type: str = 
         'transactions': transactions.to_dict('records'),  # JSON-serializable
         'summary': {
             'total_transactions': len(transactions),
-            'total_cash_flow': transactions['Cash Flow'].sum(),
-            'avg_profit_margin': transactions['Profit Margin'].mean()
+            'total_cash_flow': round(transactions['Cash Flow'].sum(), 2),
+            'avg_profit_margin': round(transactions['Profit Margin'].mean(), 2)
         }
     }
     # Добавляем метрики ликвидности в summary
