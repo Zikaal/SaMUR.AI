@@ -9,3 +9,4 @@ scikit-learn==1.5.1
 requests==2.32.3
 gunicorn==22.0.0
 cython==0.29.36  # Стабильная версия для сборки
+statsmodels==0.14.5
