@@ -10,12 +10,22 @@ import sys
 from flask import Flask, request, jsonify
 from typing import Dict, Any
 from datetime import datetime, timedelta
+import math  # Добавлено для обработки inf/NaN
+import traceback  # Для детальных ошибок
 
 # Добавляем src в sys.path, если запускаем из корня
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 # Импорт функции из Datacollector.py
-from Datacollector import collect_integrated_data, calculate_liquidity_metrics
+try:
+    from Datacollector import collect_integrated_data, calculate_liquidity_metrics
+except ImportError as e:
+    print(f"Import error: {e}. Ensure Datacollector.py is in the same directory.")
+    # Fallback: Определим заглушки, если импорт failed
+    def collect_integrated_data(start_date, end_date, account_type=None, real_time=False):
+        raise ImportError("Datacollector not available.")
+    def calculate_liquidity_metrics(transactions):
+        return {'Current Ratio': 0.0, 'Quick Ratio': 0.0, 'Cash Ratio': 0.0, 'status': 'Import error', 'recommendation': 'Fix Datacollector import.'}
 
 # Путь к данным
 DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
@@ -27,6 +37,8 @@ def remove_outliers(df: pd.DataFrame, column: str) -> pd.DataFrame:
     """
     Удаляет выбросы из столбца с помощью IQR.
     """
+    if len(df) == 0:
+        return df
     Q1 = df[column].quantile(0.25)
     Q3 = df[column].quantile(0.75)
     IQR = Q3 - Q1
@@ -39,13 +51,20 @@ def train_prophet_model(transactions: pd.DataFrame) -> Prophet:
     """
     Обучает Prophet на агрегированных данных Cash Flow с регрессорами (курсы валют).
     """
-    df_prophet = transactions.groupby('Date').agg({'Cash Flow': 'sum', 'USD_Equivalent': 'mean'}).reset_index()
-    df_prophet = df_prophet.rename(columns={'Date': 'ds', 'Cash Flow': 'y', 'USD_Equivalent': 'usd_rate'})
-    df_prophet = remove_outliers(df_prophet, 'y')
-    model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
-    model.add_regressor('usd_rate')
-    model.fit(df_prophet)
-    return model
+    try:
+        if len(transactions) == 0:
+            raise ValueError("No data for Prophet model.")
+        df_prophet = transactions.groupby('Date').agg({'Cash Flow': 'sum', 'USD_Equivalent': 'mean'}).reset_index()
+        df_prophet = df_prophet.rename(columns={'Date': 'ds', 'Cash Flow': 'y', 'USD_Equivalent': 'usd_rate'})
+        df_prophet = remove_outliers(df_prophet, 'y')
+        if len(df_prophet) < 2:
+            raise ValueError("Insufficient data after outlier removal for Prophet.")
+        model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
+        model.add_regressor('usd_rate')
+        model.fit(df_prophet)
+        return model
+    except Exception as e:
+        raise Exception(f"Error training Prophet model: {str(e)}")
 
 # 2. Сценарии "what-if" (Monte Carlo с уменьшенным шумом и расширенными параметрами)
 def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 2000, 
@@ -56,40 +75,56 @@ def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 20
     Симулирует сценарии "что если" с учётом роста курса, задержки платежей и сдвига графика закупок.
     scenario_type: 'all', 'currency_growth', 'payment_delay', 'purchase_schedule'
     """
-    results = []
-    usd_rate = transactions['USD_Equivalent'].mean()
-    for _ in range(num_simulations):
-        sim_transactions = transactions.copy()
-        if scenario_type in ['all', 'currency_growth']:
-            # Рост курса
-            simulated_rate = usd_rate * (1 + np.random.normal(currency_growth, currency_std))
-            sim_transactions['USD_Equivalent'] = sim_transactions['Transaction Amount'] / simulated_rate
-            sim_transactions['Cash Flow'] /= simulated_rate  # Корректировка Cash Flow на новый курс
-        if scenario_type in ['all', 'payment_delay']:
-            # Задержка платежа (множитель + сдвиг дат)
-            sim_transactions['Cash Flow'] *= np.random.uniform(1 - delay_factor, 1 + delay_factor)
-            delay_days = np.random.randint(0, int(delay_factor * 30))  # Задержка до 30 дней
-            sim_transactions['Date'] += pd.Timedelta(days=delay_days)
-        if scenario_type in ['all', 'purchase_schedule']:
-            # Сдвиг графика закупок
-            purchase_mask = sim_transactions['Account Type'].str.contains('Purchase|Procurement', case=False, na=False)
-            shift_days = np.random.randint(-purchase_shift_days, purchase_shift_days)
-            sim_transactions.loc[purchase_mask, 'Date'] += pd.Timedelta(days=shift_days)
-        # Агрегация по датам и суммирование Cash Flow
-        sim_cash_flow = sim_transactions.groupby('Date')['Cash Flow'].sum().sum()
-        results.append(sim_cash_flow)
-    return pd.Series(results)
+    try:
+        if len(transactions) == 0:
+            raise ValueError("No data for Monte Carlo simulation.")
+        results = []
+        usd_rate = transactions['USD_Equivalent'].mean()
+        if np.isnan(usd_rate):
+            usd_rate = 1.0
+        for _ in range(num_simulations):
+            sim_transactions = transactions.copy()
+            if scenario_type in ['all', 'currency_growth']:
+                # Рост курса
+                simulated_rate = usd_rate * (1 + np.random.normal(currency_growth, currency_std))
+                if simulated_rate == 0:
+                    simulated_rate = 1.0
+                sim_transactions['USD_Equivalent'] = sim_transactions['Transaction Amount'] / simulated_rate
+                sim_transactions['Cash Flow'] /= simulated_rate  # Корректировка Cash Flow на новый курс
+            if scenario_type in ['all', 'payment_delay']:
+                # Задержка платежа (множитель + сдвиг дат)
+                sim_transactions['Cash Flow'] *= np.random.uniform(1 - delay_factor, 1 + delay_factor)
+                delay_days = np.random.randint(0, int(delay_factor * 30))  # Задержка до 30 дней
+                sim_transactions['Date'] += pd.Timedelta(days=delay_days)
+            if scenario_type in ['all', 'purchase_schedule']:
+                # Сдвиг графика закупок
+                purchase_mask = sim_transactions['Account Type'].str.contains('Purchase|Procurement', case=False, na=False)
+                shift_days = np.random.randint(-purchase_shift_days, purchase_shift_days)
+                sim_transactions.loc[purchase_mask, 'Date'] += pd.Timedelta(days=shift_days)
+            # Агрегация по датам и суммирование Cash Flow
+            sim_cash_flow = sim_transactions.groupby('Date')['Cash Flow'].sum().sum()
+            results.append(sim_cash_flow)
+        return pd.Series(results)
+    except Exception as e:
+        raise Exception(f"Error in Monte Carlo simulation: {str(e)}")
 
 # 3. Рекомендации (Decision Tree)
 def train_recommendation_model(transactions: pd.DataFrame) -> DecisionTreeClassifier:
     """
     Обучает Decision Tree для рекомендаций по кредитам/инвестициям.
     """
-    X = transactions[['Debt-to-Equity Ratio', 'Profit Margin', 'Transaction Amount']].fillna(0)
-    y = (transactions['Transaction Outcome'] == 1).astype(int)
-    model = DecisionTreeClassifier(max_depth=3, random_state=42)
-    model.fit(X, y)
-    return model
+    try:
+        if len(transactions) == 0:
+            raise ValueError("No data for Decision Tree model.")
+        X = transactions[['Debt-to-Equity Ratio', 'Profit Margin', 'Transaction Amount']].fillna(0)
+        y = (transactions['Transaction Outcome'] == 1).astype(int)
+        if len(X) < 2 or len(np.unique(y)) < 2:
+            raise ValueError("Insufficient or unbalanced data for Decision Tree.")
+        model = DecisionTreeClassifier(max_depth=3, random_state=42)
+        model.fit(X, y)
+        return model
+    except Exception as e:
+        raise Exception(f"Error training Decision Tree model: {str(e)}")
 
 # 4. Измерьте метрики
 def evaluate_models(prophet_model: Prophet, transactions: pd.DataFrame, rec_model: DecisionTreeClassifier) -> Dict[str, Any]:
@@ -97,35 +132,44 @@ def evaluate_models(prophet_model: Prophet, transactions: pd.DataFrame, rec_mode
     Оценивает точность моделей (MAE для Prophet, F1 для Decision Tree).
     Возвращает метрики и рекомендацию.
     """
-    future = prophet_model.make_future_dataframe(periods=30)
-    last_usd_rate = transactions.groupby('Date').agg({'USD_Equivalent': 'mean'}).iloc[-1]['USD_Equivalent']
-    future['usd_rate'] = last_usd_rate
-    forecast = prophet_model.predict(future)
-    true_values = transactions.groupby('Date').agg({'Cash Flow': 'sum'}).reindex(future['ds']).fillna(0)['Cash Flow']
-    mae = round(mean_absolute_error(true_values[-30:], forecast['yhat'][-30:]), 2)
-    X_test = transactions[['Debt-to-Equity Ratio', 'Profit Margin', 'Transaction Amount']].fillna(0)
-    y_pred = rec_model.predict(X_test)
-    f1 = round(f1_score((transactions['Transaction Outcome'] == 1).astype(int), y_pred), 2)
-    
-    # Генерация рекомендации на основе метрик моделей
-    recommendation = "Model performance is adequate."
-    if mae > 1000:
-        recommendation = "Improve forecasting model accuracy by adding more features or data."
-    elif f1 < 0.7:
-        recommendation = "Enhance recommendation model by tuning parameters or increasing training data."
-    
-    return {
-        'MAE (Prophet)': mae,
-        'F1-Score (Recommendations)': f1,
-        'recommendation': recommendation
-    }
+    try:
+        future = prophet_model.make_future_dataframe(periods=30)
+        last_usd_rate = transactions.groupby('Date').agg({'USD_Equivalent': 'mean'}).iloc[-1]['USD_Equivalent']
+        future['usd_rate'] = last_usd_rate
+        forecast = prophet_model.predict(future)
+        true_values = transactions.groupby('Date').agg({'Cash Flow': 'sum'}).reindex(future['ds']).fillna(0)['Cash Flow']
+        mae = round(mean_absolute_error(true_values[-30:], forecast['yhat'][-30:]), 2)
+        X_test = transactions[['Debt-to-Equity Ratio', 'Profit Margin', 'Transaction Amount']].fillna(0)
+        y_pred = rec_model.predict(X_test)
+        f1 = round(f1_score((transactions['Transaction Outcome'] == 1).astype(int), y_pred), 2)
+        
+        # Генерация рекомендации на основе метрик моделей
+        recommendation = "Model performance is adequate."
+        if mae > 1000:
+            recommendation = "Improve forecasting model accuracy by adding more features or data."
+        elif f1 < 0.7:
+            recommendation = "Enhance recommendation model by tuning parameters or increasing training data."
+        
+        return {
+            'MAE (Prophet)': mae,
+            'F1-Score (Recommendations)': f1,
+            'recommendation': recommendation
+        }
+    except Exception as e:
+        return {
+            'MAE (Prophet)': 0.0,
+            'F1-Score (Recommendations)': 0.0,
+            'recommendation': f"Error evaluating models: {str(e)}"
+        }
 
-# Вспомогательная функция для сериализации
+# Вспомогательная функция для сериализации (фикс для inf/NaN)
 def convert_to_serializable(obj):
-    """Преобразует NumPy-типы в стандартные Python-типы."""
+    """Преобразует NumPy-типы в стандартные Python-типы, фиксит inf/NaN."""
     if isinstance(obj, np.integer):
         return int(obj)
     elif isinstance(obj, np.floating):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0.0
         return float(obj)
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
@@ -135,6 +179,15 @@ def convert_to_serializable(obj):
         return obj.to_dict(orient='records')
     else:
         return obj
+
+# Общая функция для обработки ошибок в эндпоинтах
+def handle_error(e, endpoint_name):
+    error_details = {
+        'error': str(e),
+        'endpoint': endpoint_name,
+        'traceback': traceback.format_exc()[:500]  # Ограничено для безопасности
+    }
+    return jsonify(error_details), 500
 
 # Эндпоинты API
 
@@ -154,7 +207,7 @@ def get_data():
         serialized_data = json.loads(json.dumps(data, default=convert_to_serializable))
         return jsonify(serialized_data)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return handle_error(e, '/api/data')
 
 # Эндпоинт для получения метрик моделей
 @app.route('/api/metrics', methods=['GET'])
@@ -176,7 +229,7 @@ def get_metrics():
         serialized_metrics = json.loads(json.dumps(metrics, default=convert_to_serializable))
         return jsonify(serialized_metrics)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return handle_error(e, '/api/metrics')
 
 # Эндпоинты для отчётов по ликвидности
 
@@ -197,7 +250,7 @@ def get_liquidity_report():
         serialized_metrics = json.loads(json.dumps(liquidity_metrics, default=convert_to_serializable))
         return jsonify(serialized_metrics)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return handle_error(e, '/api/liquidity')
 
 # Отчёт по ликвидности в реальном времени (последние 24 часа)
 @app.route('/api/liquidity/real-time', methods=['GET'])
@@ -214,7 +267,7 @@ def get_real_time_liquidity():
         serialized_metrics = json.loads(json.dumps(liquidity_metrics, default=convert_to_serializable))
         return jsonify(serialized_metrics)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return handle_error(e, '/api/liquidity/real-time')
 
 # Эндпоинты для сценариев "что если"
 
@@ -248,7 +301,7 @@ def get_what_if_scenarios():
         recommendation = "Scenario impacts are within acceptable range."
         if mean_cash_flow < 0:
             recommendation = "Mitigate combined risks (currency, delays, schedule shifts) to avoid negative cash flow."
-        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5:
+        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5 if mean_cash_flow != 0 else True:
             recommendation = "High variability in scenarios; implement risk management strategies."
         
         scenarios = {
@@ -269,7 +322,7 @@ def get_what_if_scenarios():
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
         return jsonify(serialized_scenarios)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return handle_error(e, '/api/what-if')
 
 # Сценарий "рост курса валют"
 @app.route('/api/what-if/currency-growth', methods=['GET'])
@@ -298,7 +351,7 @@ def get_currency_growth_scenario():
         recommendation = "Currency growth impact is manageable."
         if mean_cash_flow < 0:
             recommendation = "Hedge against currency fluctuations to mitigate negative cash flow impact."
-        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5:
+        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5 if mean_cash_flow != 0 else True:
             recommendation = "High uncertainty in currency growth; consider currency risk hedging."
         
         scenarios = {
@@ -317,7 +370,7 @@ def get_currency_growth_scenario():
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
         return jsonify(serialized_scenarios)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return handle_error(e, '/api/what-if/currency-growth')
 
 # Сценарий "задержка платежа"
 @app.route('/api/what-if/payment-delay', methods=['GET'])
@@ -345,7 +398,7 @@ def get_payment_delay_scenario():
         recommendation = "Payment delay impact is manageable."
         if mean_cash_flow < 0:
             recommendation = "Improve payment collection processes to minimize delay impacts."
-        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5:
+        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5 if mean_cash_flow != 0 else True:
             recommendation = "High variability in payment delays; establish stricter payment terms."
         
         scenarios = {
@@ -363,7 +416,7 @@ def get_payment_delay_scenario():
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
         return jsonify(serialized_scenarios)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return handle_error(e, '/api/what-if/payment-delay')
 
 # Сценарий "изменение графика закупок"
 @app.route('/api/what-if/purchase-schedule', methods=['GET'])
@@ -391,7 +444,7 @@ def get_purchase_schedule_scenario():
         recommendation = "Purchase schedule changes are manageable."
         if mean_cash_flow < 0:
             recommendation = "Optimize purchase schedule to avoid negative cash flow impacts."
-        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5:
+        elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5 if mean_cash_flow != 0 else True:
             recommendation = "High variability in purchase schedule shifts; stabilize procurement planning."
         
         scenarios = {
@@ -409,7 +462,13 @@ def get_purchase_schedule_scenario():
         serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
         return jsonify(serialized_scenarios)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return handle_error(e, '/api/what-if/purchase-schedule')
+
+# Добавьте health-check эндпоинт для Render
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "OK"}), 200
 
 if __name__ == "__main__":
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Для локального запуска
+    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
