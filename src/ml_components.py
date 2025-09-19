@@ -495,6 +495,56 @@ def get_tables():
         return jsonify({'tables': tables})
     except Exception as e:
         return handle_error(e, '/api/tables')
+    
+@app.route('/api/select-table', methods=['POST'])
+def select_table():
+    try:
+        log_memory_usage()
+        data = request.get_json()
+        if not data or 'table' not in data:
+            return jsonify({'error': 'No table name provided in request body'}), 400
+        table_name = data['table']
+        if not table_name:
+            return jsonify({'error': 'Table name cannot be empty'}), 400
+
+        # Verify table exists in the database
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                AND table_type = 'BASE TABLE'
+                AND table_name = :table_name
+            """), {'table_name': table_name})
+            if not result.fetchone():
+                return jsonify({'error': f'Table "{table_name}" does not exist'}), 400
+
+            # Check column structure
+            result = conn.execute(text("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                AND table_name = :table_name
+            """), {'table_name': table_name})
+            existing_columns = [row[0] for row in result.fetchall()]
+            missing_columns = [col for col in REQUIRED_COLUMNS if col not in existing_columns]
+
+            if missing_columns:
+                return jsonify({
+                    'error': 'Missing required columns in table',
+                    'missing_columns': missing_columns,
+                    'table_name': table_name
+                }), 400
+
+        global selected_table
+        selected_table = table_name
+        return jsonify({
+            'message': f'Table "{table_name}" selected successfully',
+            'table_name': table_name,
+            'columns': existing_columns
+        })
+    except Exception as e:
+        return handle_error(e, '/api/select-table')
 
 @app.route('/api/upload-csv', methods=['POST'])
 def upload_csv():
@@ -518,6 +568,7 @@ def upload_csv():
             return jsonify({'error': 'Invalid file type. Only .csv files are allowed'}), 400
     except Exception as e:
         return handle_error(e, '/api/upload-csv')
+
 
 if __name__ == "__main__":
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
