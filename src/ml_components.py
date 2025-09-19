@@ -1,107 +1,61 @@
 import pandas as pd
 import numpy as np
-from prophet import Prophet
-from statsmodels.tsa.arima.model import ARIMA
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import mean_absolute_error, f1_score
 import json
 import os
 import sys
 import logging
-from flask import Flask, request, jsonify
-from typing import Dict, Any
+from flask import Flask, request, jsonify, render_template_string
+from typing import Dict
 from datetime import datetime, timedelta
-import math  # Для обработки inf/NaN
-import traceback  # Для детальных ошибок
+import traceback
+import psutil
+from sqlalchemy import create_engine
+
+# Настройка базы данных
+DB_URL = "postgresql://postgres.zolipjvrqejnhbendclq:fLXxkf42l6NtY@aws-1-eu-north-1.pooler.supabase.com:6543/postgres"
+engine = create_engine(DB_URL)
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('app.log'),  # Логи в файл app.log
-        logging.StreamHandler()  # Логи в консоль
+        logging.FileHandler('app.log'),
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Добавляем src в sys.path, если запускаем из корня
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+# Настройка sys.path для импорта Datacollector
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Импорт функций из Datacollector.py
+# Импорт Datacollector
 try:
     from Datacollector import collect_integrated_data, calculate_liquidity_metrics, BANK_SYMBOLS
 except ImportError as e:
-    logger.error(f"Import error: {e}. Ensure Datacollector.py is in the same directory.")
-    # Fallback: Определим заглушки
+    logger.error(f"Import error: {e}. Ensure Datacollector.py is in the src directory.")
     def collect_integrated_data(start_date, end_date, account_type=None, symbol=None, real_time=False):
         raise ImportError("Datacollector not available.")
     def calculate_liquidity_metrics(transactions):
         return {'Liquidity Ratio': 0.0, 'status': 'Import error', 'recommendation': 'Fix Datacollector import.'}
-    BANK_SYMBOLS = ['WFC', 'JPM', 'SBER']  # Минимальный fallback
-
-# Путь к данным
-DATA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+    BANK_SYMBOLS = ['WFC', 'JPM', 'SBER']
 
 app = Flask(__name__)
 
-# Функция для обработки выбросов (IQR метод)
-def remove_outliers(df: pd.DataFrame, column: str) -> pd.DataFrame:
-    """Удаляет выбросы из столбца с помощью IQR."""
-    if len(df) == 0:
-        return df
-    Q1 = df[column].quantile(0.25)
-    Q3 = df[column].quantile(0.75)
-    IQR = Q3 - Q1
-    lower_bound = Q1 - 1.5 * IQR
-    upper_bound = Q3 + 1.5 * IQR
-    return df[(df[column] >= lower_bound) & (df[column] <= upper_bound)]
+# Логирование памяти
+def log_memory_usage():
+    process = psutil.Process(os.getpid())
+    memory_usage = process.memory_info().rss / 1024 / 1024
+    logger.info(f"Memory usage: {memory_usage:.2f} MB")
 
-# 1. Постройте модели: Прогноз потоков (Prophet с регрессорами, per-symbol)
-def train_prophet_model(transactions: pd.DataFrame, symbol: str = None) -> Dict[str, Prophet]:
-    """Обучает Prophet на агрегированных данных Cash Flow с регрессорами."""
-    try:
-        if len(transactions) == 0:
-            raise ValueError("No data for Prophet model.")
-        
-        models = {}
-        if symbol:
-            df_filtered = transactions[transactions['Symbol'] == symbol]
-            if len(df_filtered) < 2:
-                raise ValueError(f"Insufficient data for {symbol}.")
-            df_prophet = df_filtered.groupby('Date').agg({'Cash Flow': 'sum', 'USD_Equivalent': 'mean', 'Liquidity Ratio': 'mean'}).reset_index()
-            df_prophet = df_prophet.rename(columns={'Date': 'ds', 'Cash Flow': 'y', 'USD_Equivalent': 'usd_rate', 'Liquidity Ratio': 'liq_ratio'})
-            df_prophet = remove_outliers(df_prophet, 'y').dropna()
-            if len(df_prophet) < 2 or df_prophet['y'].isna().all():
-                raise ValueError(f"Insufficient clean data for {symbol} after outlier removal.")
-            model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
-            model.add_regressor('usd_rate')
-            model.add_regressor('liq_ratio')
-            model.fit(df_prophet)
-            models[symbol] = model
-        else:
-            for sym in transactions['Symbol'].unique():
-                if sym in BANK_SYMBOLS:
-                    sym_data = train_prophet_model(transactions[transactions['Symbol'] == sym], sym)
-                    models.update(sym_data)
-        
-        if not models:
-            raise ValueError("No valid models trained.")
-        return models
-    except Exception as e:
-        logger.error(f"Error training Prophet model: {str(e)} - Traceback: {traceback.format_exc()}")
-        raise
-
-# 2. Сценарии "what-if" (Monte Carlo, per-symbol)
-def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 500,  # Ограничено для скорости
+# 2. Monte Carlo
+def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 20,
                            currency_growth: float = 0.1, currency_std: float = 0.01, 
                            delay_factor: float = 0.05, purchase_shift_days: int = 0,
                            scenario_type: str = 'all', symbol: str = None) -> Dict[str, pd.Series]:
-    """Симулирует сценарии 'что если' per-symbol."""
     try:
         if len(transactions) == 0:
             raise ValueError("No data for Monte Carlo simulation.")
-        
         results = {}
         if symbol:
             sim_data = transactions[transactions['Symbol'] == symbol].copy()
@@ -116,7 +70,6 @@ def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 50
                     if len(sym_data) > 0:
                         sim_results = _run_monte_carlo(sym_data, num_simulations, currency_growth, currency_std, delay_factor, purchase_shift_days, scenario_type)
                         results[sym] = sim_results
-        
         if not results:
             raise ValueError("No simulations run.")
         return results
@@ -126,7 +79,6 @@ def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 50
 
 def _run_monte_carlo(transactions: pd.DataFrame, num_simulations: int, currency_growth: float, currency_std: float, 
                      delay_factor: float, purchase_shift_days: int, scenario_type: str) -> pd.Series:
-    """Внутренняя функция для single run."""
     sim_results = []
     usd_rate = transactions['USD_Equivalent'].mean()
     if np.isnan(usd_rate):
@@ -142,7 +94,7 @@ def _run_monte_carlo(transactions: pd.DataFrame, num_simulations: int, currency_
             sim_transactions['Cash Flow'] *= np.random.uniform(1 - delay_factor, 1 + delay_factor)
             delay_days = np.random.randint(0, int(delay_factor * 30))
             sim_transactions['Date'] = pd.to_datetime(sim_transactions['Date']) + pd.Timedelta(days=delay_days)
-        if scenario_type in ['all', 'purchase_schedule']:
+        if scenario_type in ['all', 'purchase_schedule'] and purchase_shift_days != 0:
             purchase_mask = sim_transactions['Account Type'].str.contains('Purchase|Procurement', case=False, na=False)
             shift_days = np.random.randint(-purchase_shift_days, purchase_shift_days)
             sim_transactions.loc[purchase_mask, 'Date'] = pd.to_datetime(sim_transactions.loc[purchase_mask, 'Date']) + pd.Timedelta(days=shift_days)
@@ -150,414 +102,344 @@ def _run_monte_carlo(transactions: pd.DataFrame, num_simulations: int, currency_
         sim_results.append(sim_cash_flow)
     return pd.Series(sim_results)
 
-# 3. Рекомендации (Decision Tree с Liquidity Ratio)
-def train_recommendation_model(transactions: pd.DataFrame, symbol: str = None) -> Dict[str, DecisionTreeClassifier]:
-    """Обучает Decision Tree для рекомендаций по кредитам/инвестициям, per-symbol."""
-    try:
-        if len(transactions) == 0:
-            raise ValueError("No data for Decision Tree model.")
-        
-        models = {}
-        if symbol:
-            df_filtered = transactions[transactions['Symbol'] == symbol]
-            if len(df_filtered) < 2:
-                raise ValueError(f"Insufficient data for {symbol}.")
-            X = df_filtered[['Debt-to-Equity Ratio', 'Profit Margin', 'Transaction Amount', 'Liquidity Ratio']].fillna(0)
-            y = (df_filtered['Transaction Outcome'] == 1).astype(int)
-            if len(np.unique(y)) < 2:
-                raise ValueError(f"Unbalanced data for {symbol}.")
-        else:
-            for sym in transactions['Symbol'].unique():
-                if sym in BANK_SYMBOLS:
-                    sym_data = transactions[transactions['Symbol'] == sym]
-                    if len(sym_data) >= 2:
-                        X_sym = sym_data[['Debt-to-Equity Ratio', 'Profit Margin', 'Transaction Amount', 'Liquidity Ratio']].fillna(0)
-                        y_sym = (sym_data['Transaction Outcome'] == 1).astype(int)
-                        if len(np.unique(y_sym)) >= 2:
-                            model = DecisionTreeClassifier(max_depth=3, random_state=42)
-                            model.fit(X_sym, y_sym)
-                            models[sym] = model
-        
-        if not models:
-            raise ValueError("No valid models trained.")
-        return models
-    except Exception as e:
-        logger.error(f"Error training Decision Tree model: {str(e)} - Traceback: {traceback.format_exc()}")
-        raise
-
-# 4. Измерьте метрики (per-symbol)
-def evaluate_models(prophet_models: Dict[str, Prophet], transactions: pd.DataFrame, rec_models: Dict[str, DecisionTreeClassifier], symbol: str = None) -> Dict[str, Any]:
-    """Оценивает точность моделей (MAE для Prophet, F1 для Decision Tree), per-symbol."""
-    try:
-        metrics = {}
-        if symbol and symbol in prophet_models:
-            prophet_model = prophet_models[symbol]
-            rec_model = rec_models.get(symbol)
-            sym_trans = transactions[transactions['Symbol'] == symbol]
-            if len(sym_trans) == 0:
-                raise ValueError(f"No data for {symbol}.")
-            future = prophet_model.make_future_dataframe(periods=30)
-            last_usd_rate = sym_trans.groupby('Date').agg({'USD_Equivalent': 'mean'}).iloc[-1]['USD_Equivalent'] if not sym_trans['USD_Equivalent'].isna().all() else 1.0
-            last_liq = sym_trans['Liquidity Ratio'].mean() if 'Liquidity Ratio' in sym_trans.columns and not sym_trans['Liquidity Ratio'].isna().all() else 1.0
-            future['usd_rate'] = last_usd_rate
-            future['liq_ratio'] = last_liq
-            forecast = prophet_model.predict(future)
-            true_values = sym_trans.groupby('Date').agg({'Cash Flow': 'sum'}).reindex(future['ds']).fillna(0)['Cash Flow']
-            if len(true_values) < 30 or len(forecast['yhat']) < 30:
-                mae = 0.0
-            else:
-                mae = round(mean_absolute_error(true_values[-30:], forecast['yhat'][-30:]), 2)
-            X_test = sym_trans[['Debt-to-Equity Ratio', 'Profit Margin', 'Transaction Amount', 'Liquidity Ratio']].fillna(0)
-            y_true = (sym_trans['Transaction Outcome'] == 1).astype(int)
-            if rec_model and len(X_test) > 0 and len(y_true) > 0:
-                y_pred = rec_model.predict(X_test)
-                f1 = round(f1_score(y_true, y_pred, zero_division=0), 2)
-            else:
-                f1 = 0.0
-            metrics[symbol] = {'MAE (Prophet)': mae, 'F1-Score (Recommendations)': f1}
-        else:
-            for sym in set(list(prophet_models.keys()) + list(rec_models.keys())):
-                if sym in BANK_SYMBOLS:
-                    sym_metrics = evaluate_models({sym: prophet_models[sym]}, transactions, {sym: rec_models[sym]}, sym)
-                    metrics.update(sym_metrics)
-        
-        avg_mae = np.mean([m['MAE (Prophet)'] for m in metrics.values() if m['MAE (Prophet)'] > 0])
-        avg_f1 = np.mean([m['F1-Score (Recommendations)'] for m in metrics.values() if m['F1-Score (Recommendations)'] > 0])
-        recommendation = "Model performance is adequate."
-        if avg_mae > 1000 or np.isnan(avg_mae):
-            recommendation = "Improve forecasting by adding more bank-specific features."
-        elif avg_f1 < 0.7 or np.isnan(avg_f1):
-            recommendation = "Enhance recommendations with liquidity thresholds."
-        
-        overall = {'overall': {'avg_MAE': round(avg_mae, 2) if not np.isnan(avg_mae) else 0.0, 
-                              'avg_F1': round(avg_f1, 2) if not np.isnan(avg_f1) else 0.0, 
-                              'recommendation': recommendation}}
-        return {**metrics, **overall}
-    except Exception as e:
-        logger.error(f"Error evaluating models: {str(e)} - Traceback: {traceback.format_exc()}")
-        return {'overall': {'avg_MAE': 0.0, 'avg_F1': 0.0, 'recommendation': f"Error evaluating models: {str(e)}"}}
-
-# Вспомогательная функция для сериализации
+# Сериализация
 def convert_to_serializable(obj):
-    """Преобразует NumPy-типы в стандартные Python-типы, фиксит inf/NaN."""
-    if isinstance(obj, np.integer):
-        return int(obj)
-    elif isinstance(obj, np.floating):
-        if math.isnan(obj) or math.isinf(obj):
-            return 0.0
-        return float(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, pd.Timestamp):
-        return obj.isoformat()
-    elif isinstance(obj, pd.DataFrame):
-        return obj.to_dict(orient='records')
-    elif isinstance(obj, dict) and 'models' in obj:
-        return {'note': 'Models not serialized; use for prediction only'}
-    else:
-        return obj
+    if isinstance(obj, (np.integer, np.floating)): return float(obj) if np.isnan(obj) or np.isinf(obj) else float(obj)
+    if isinstance(obj, np.ndarray): return obj.tolist()
+    if isinstance(obj, pd.Timestamp): return obj.isoformat()
+    if isinstance(obj, pd.DataFrame): return obj.to_dict(orient='records')
+    if isinstance(obj, dict) and 'model' in obj: return {'note': 'Model not serialized'}
+    return obj
 
-# Обработка ошибок в эндпоинтах
+# Обработка ошибок
 def handle_error(e, endpoint_name):
-    logger.error(f"Error in {endpoint_name}: {str(e)} - Traceback: {traceback.format_exc()}")
-    error_details = {
-        'error': str(e),
-        'endpoint': endpoint_name,
-        'traceback': traceback.format_exc()[:500]
-    }
-    return jsonify(error_details), 500
+    logger.error(f"Error in {endpoint_name}: {str(e)} - {traceback.format_exc()}")
+    return jsonify({'error': str(e), 'endpoint': endpoint_name, 'traceback': traceback.format_exc()[:500]}), 500
 
-# Эндпоинт: Список банков
+# Эндпоинты
 @app.route('/api/banks', methods=['GET'])
 def get_banks():
     try:
+        log_memory_usage()
         return jsonify({'banks': BANK_SYMBOLS})
     except Exception as e:
         return handle_error(e, '/api/banks')
 
-# Эндпоинт: Получение данных
 @app.route('/api/data', methods=['GET'])
 def get_data():
-    start = request.args.get('start')
-    end = request.args.get('end')
-    account_type = request.args.get('account_type')
-    symbol = request.args.get('symbol')
-    
-    if not start or not end:
-        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
-    
+    start, end = request.args.get('start'), request.args.get('end')
+    if not start or not end: return jsonify({"error": "Missing start/end"}), 400
     try:
-        data = collect_integrated_data(start, end, account_type, symbol)
-        serialized_data = json.loads(json.dumps(data, default=convert_to_serializable))
-        return jsonify(serialized_data)
+        log_memory_usage()
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
+        return jsonify(json.loads(json.dumps(data, default=convert_to_serializable)))
     except Exception as e:
         return handle_error(e, '/api/data')
 
-# Эндпоинт: Метрики моделей (исправлен)
-@app.route('/api/metrics', methods=['GET'])
-def get_metrics():
-    start = request.args.get('start')
-    end = request.args.get('end')
-    account_type = request.args.get('account_type')
-    symbol = request.args.get('symbol')
-    
-    if not start or not end:
-        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
-    
-    try:
-        data = collect_integrated_data(start, end, account_type, symbol)
-        if 'transactions' not in data or not data['transactions']:
-            raise ValueError("No transactions in data")
-        transactions = pd.DataFrame(data['transactions'])
-        if transactions.empty:
-            raise ValueError("Empty transactions DataFrame")
-        required_cols = ['Cash Flow', 'Symbol', 'Liquidity Ratio']
-        missing_cols = [col for col in required_cols if col not in transactions.columns]
-        if missing_cols:
-            raise ValueError(f"Missing columns: {missing_cols}")
-        
-        prophet_models = train_prophet_model(transactions, symbol) or {}
-        rec_models = train_recommendation_model(transactions, symbol) or {}
-        if not prophet_models:
-            raise ValueError("Failed to train Prophet model")
-        metrics = evaluate_models(prophet_models, transactions, rec_models, symbol)
-        serialized_metrics = json.loads(json.dumps(metrics, default=convert_to_serializable))
-        return jsonify(serialized_metrics)
-    except ValueError as ve:
-        return jsonify({"error": f"Value error: {str(ve)}"}), 400
-    except Exception as e:
-        return handle_error(e, '/api/metrics')
-
-# Эндпоинты для отчётов по ликвидности
-
 @app.route('/api/liquidity', methods=['GET'])
 def get_liquidity_report():
-    start = request.args.get('start')
-    end = request.args.get('end')
-    account_type = request.args.get('account_type')
-    symbol = request.args.get('symbol')
-    
-    if not start or not end:
-        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
-    
+    start, end = request.args.get('start'), request.args.get('end')
+    if not start or not end: return jsonify({"error": "Missing start/end"}), 400
     try:
-        data = collect_integrated_data(start, end, account_type, symbol)
-        transactions = pd.DataFrame(data['transactions'])
-        liquidity_metrics = calculate_liquidity_metrics(transactions)
-        serialized_metrics = json.loads(json.dumps(liquidity_metrics, default=convert_to_serializable))
-        return jsonify(serialized_metrics)
+        log_memory_usage()
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
+        return jsonify(json.loads(json.dumps(calculate_liquidity_metrics(pd.DataFrame(data['transactions'])), default=convert_to_serializable)))
     except Exception as e:
         return handle_error(e, '/api/liquidity')
 
-@app.route('/api/liquidity/real-time', methods=['GET'])
-def get_real_time_liquidity():
-    current_time = datetime.now() + timedelta(hours=5)  # 12:12 PM +05, 2025-09-19
-    end = current_time.strftime('%Y-%m-%d')
-    start = (current_time - timedelta(days=1)).strftime('%Y-%m-%d')
-    account_type = request.args.get('account_type')
-    symbol = request.args.get('symbol')
-    
-    try:
-        data = collect_integrated_data(start, end, account_type, symbol, real_time=True)
-        transactions = pd.DataFrame(data['transactions'])
-        liquidity_metrics = calculate_liquidity_metrics(transactions)
-        liquidity_metrics['timestamp'] = current_time.isoformat()
-        serialized_metrics = json.loads(json.dumps(liquidity_metrics, default=convert_to_serializable))
-        return jsonify(serialized_metrics)
-    except Exception as e:
-        return handle_error(e, '/api/liquidity/real-time')
-
-# Эндпоинты для сценариев "что если"
-
-@app.route('/api/what-if', methods=['GET'])
-def get_what_if_scenarios():
-    start = request.args.get('start')
-    end = request.args.get('end')
-    account_type = request.args.get('account_type')
-    symbol = request.args.get('symbol')
-    currency_growth = float(request.args.get('currency_growth', 0.1))
-    currency_std = float(request.args.get('currency_std', 0.01))
-    delay_factor = float(request.args.get('delay_factor', 0.05))
-    purchase_shift_days = int(request.args.get('purchase_shift_days', 0))
-    num_simulations = int(request.args.get('num_simulations', 500))  # Ограничено для скорости
-    
+def get_what_if_common(scenario_type: str):
+    start, end = request.args.get('start'), request.args.get('end')
     if not start or not end:
-        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
-    
+        return jsonify({"error": "Missing start/end"}), 400
     try:
-        data = collect_integrated_data(start, end, account_type, symbol)
-        if 'transactions' not in data or not data['transactions']:
-            raise ValueError("No transactions in data")
+        log_memory_usage()
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
         transactions = pd.DataFrame(data['transactions'])
-        if transactions.empty:
-            raise ValueError("Empty transactions DataFrame")
-        sim_results = monte_carlo_simulation(transactions, num_simulations, currency_growth, currency_std, 
-                                             delay_factor, purchase_shift_days, scenario_type='all', symbol=symbol)
-        summaries = {}
-        for sym, results in sim_results.items():
-            mean_cash_flow = round(results.mean(), 2)
-            ci_low = round(results.quantile(0.025), 2)
-            ci_high = round(results.quantile(0.975), 2)
-            recommendation = "Scenario impacts are within acceptable range."
-            if mean_cash_flow < 0:
-                recommendation = f"Mitigate risks for {sym} to avoid negative cash flow."
-            elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5 if mean_cash_flow != 0 else True:
-                recommendation = f"High variability for {sym}; implement risk strategies."
-            summaries[sym] = {'mean_cash_flow': mean_cash_flow, 'ci_low': ci_low, 'ci_high': ci_high, 'recommendation': recommendation}
-        
-        scenarios = {
-            'scenarios': {sym: results.tolist() for sym, results in sim_results.items()},
-            'parameters': {
-                'currency_growth': currency_growth,
-                'currency_std': currency_std,
-                'delay_factor': delay_factor,
-                'purchase_shift_days': purchase_shift_days
-            },
-            'summary': summaries
+        try:
+            num_simulations = int(request.args.get('num_simulations', 20))
+            currency_growth = float(request.args.get('currency_growth', 0.1))
+            currency_std = float(request.args.get('currency_std', 0.01))
+            delay_factor = float(request.args.get('delay_factor', 0.05))
+            purchase_shift_days_raw = request.args.get('purchase_shift_days', '0')
+            purchase_shift_days_clean = ''.join(c for c in purchase_shift_days_raw if c.isdigit() or c == '-')
+            purchase_shift_days = int(purchase_shift_days_clean) if purchase_shift_days_clean else 0
+        except ValueError as e:
+            logger.error(f"Invalid query parameter: {str(e)}")
+            return jsonify({"error": f"Invalid query parameter: {str(e)}"}), 400
+        sim_results = monte_carlo_simulation(
+            transactions,
+            num_simulations,
+            currency_growth,
+            currency_std,
+            delay_factor,
+            purchase_shift_days,
+            scenario_type,
+            request.args.get('symbol')
+        )
+        summaries = {
+            sym: {
+                'mean': round(r.mean(), 2),
+                'ci': [round(r.quantile(0.025), 2), round(r.quantile(0.975), 2)],
+                'recommendation': "Within range." if r.mean() >= 0 else f"Mitigate risks for {sym}."
+            }
+            for sym, r in sim_results.items()
         }
-        serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
-        return jsonify(serialized_scenarios)
+        return jsonify({
+            'scenarios': {sym: r.tolist() for sym, r in sim_results.items()},
+            'summary': summaries
+        })
     except Exception as e:
-        return handle_error(e, '/api/what-if')
+        return handle_error(e, f'/api/what-if/{scenario_type}')
+
+@app.route('/api/what-if/all', methods=['GET'])
+def get_what_if_all():
+    return get_what_if_common('all')
 
 @app.route('/api/what-if/currency-growth', methods=['GET'])
-def get_currency_growth_scenario():
-    start = request.args.get('start')
-    end = request.args.get('end')
-    account_type = request.args.get('account_type')
-    symbol = request.args.get('symbol')
-    currency_growth = float(request.args.get('currency_growth', 0.1))
-    currency_std = float(request.args.get('currency_std', 0.01))
-    num_simulations = int(request.args.get('num_simulations', 500))
-    
-    if not start or not end:
-        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
-    
-    try:
-        data = collect_integrated_data(start, end, account_type, symbol)
-        if 'transactions' not in data or not data['transactions']:
-            raise ValueError("No transactions in data")
-        transactions = pd.DataFrame(data['transactions'])
-        if transactions.empty:
-            raise ValueError("Empty transactions DataFrame")
-        sim_results = monte_carlo_simulation(transactions, num_simulations, currency_growth, currency_std, 
-                                             scenario_type='currency_growth', symbol=symbol)
-        summaries = {}
-        for sym, results in sim_results.items():
-            mean_cash_flow = round(results.mean(), 2)
-            ci_low = round(results.quantile(0.025), 2)
-            ci_high = round(results.quantile(0.975), 2)
-            recommendation = "Currency growth impact is manageable."
-            if mean_cash_flow < 0:
-                recommendation = f"Hedge against currency fluctuations for {sym}."
-            elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5 if mean_cash_flow != 0 else True:
-                recommendation = f"High uncertainty in {sym} currency growth; consider hedging."
-            summaries[sym] = {'mean_cash_flow': mean_cash_flow, 'ci_low': ci_low, 'ci_high': ci_high, 'recommendation': recommendation}
-        
-        scenarios = {
-            'scenarios': {sym: results.tolist() for sym, results in sim_results.items()},
-            'parameters': {'currency_growth': currency_growth, 'currency_std': currency_std},
-            'summary': summaries
-        }
-        serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
-        return jsonify(serialized_scenarios)
-    except Exception as e:
-        return handle_error(e, '/api/what-if/currency-growth')
+def get_what_if_currency_growth():
+    return get_what_if_common('currency_growth')
 
 @app.route('/api/what-if/payment-delay', methods=['GET'])
-def get_payment_delay_scenario():
-    start = request.args.get('start')
-    end = request.args.get('end')
-    account_type = request.args.get('account_type')
-    symbol = request.args.get('symbol')
-    delay_factor = float(request.args.get('delay_factor', 0.05))
-    num_simulations = int(request.args.get('num_simulations', 500))
-    
-    if not start or not end:
-        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
-    
-    try:
-        data = collect_integrated_data(start, end, account_type, symbol)
-        if 'transactions' not in data or not data['transactions']:
-            raise ValueError("No transactions in data")
-        transactions = pd.DataFrame(data['transactions'])
-        if transactions.empty:
-            raise ValueError("Empty transactions DataFrame")
-        sim_results = monte_carlo_simulation(transactions, num_simulations, delay_factor=delay_factor, 
-                                             scenario_type='payment_delay', symbol=symbol)
-        summaries = {}
-        for sym, results in sim_results.items():
-            mean_cash_flow = round(results.mean(), 2)
-            ci_low = round(results.quantile(0.025), 2)
-            ci_high = round(results.quantile(0.975), 2)
-            recommendation = "Payment delay impact is manageable."
-            if mean_cash_flow < 0:
-                recommendation = f"Improve payment collection for {sym}."
-            elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5 if mean_cash_flow != 0 else True:
-                recommendation = f"High variability in {sym} payment delays; tighten terms."
-            summaries[sym] = {'mean_cash_flow': mean_cash_flow, 'ci_low': ci_low, 'ci_high': ci_high, 'recommendation': recommendation}
-        
-        scenarios = {
-            'scenarios': {sym: results.tolist() for sym, results in sim_results.items()},
-            'parameters': {'delay_factor': delay_factor},
-            'summary': summaries
-        }
-        serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
-        return jsonify(serialized_scenarios)
-    except Exception as e:
-        return handle_error(e, '/api/what-if/payment-delay')
+def get_what_if_payment_delay():
+    return get_what_if_common('payment_delay')
 
 @app.route('/api/what-if/purchase-schedule', methods=['GET'])
-def get_purchase_schedule_scenario():
-    start = request.args.get('start')
-    end = request.args.get('end')
-    account_type = request.args.get('account_type')
-    symbol = request.args.get('symbol')
-    purchase_shift_days = int(request.args.get('purchase_shift_days', 0))
-    num_simulations = int(request.args.get('num_simulations', 500))
-    
-    if not start or not end:
-        return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
-    
-    try:
-        data = collect_integrated_data(start, end, account_type, symbol)
-        if 'transactions' not in data or not data['transactions']:
-            raise ValueError("No transactions in data")
-        transactions = pd.DataFrame(data['transactions'])
-        if transactions.empty:
-            raise ValueError("Empty transactions DataFrame")
-        sim_results = monte_carlo_simulation(transactions, num_simulations, purchase_shift_days=purchase_shift_days, 
-                                             scenario_type='purchase_schedule', symbol=symbol)
-        summaries = {}
-        for sym, results in sim_results.items():
-            mean_cash_flow = round(results.mean(), 2)
-            ci_low = round(results.quantile(0.025), 2)
-            ci_high = round(results.quantile(0.975), 2)
-            recommendation = "Purchase schedule changes are manageable."
-            if mean_cash_flow < 0:
-                recommendation = f"Optimize {sym} purchase schedule."
-            elif (ci_high - ci_low) / abs(mean_cash_flow) > 0.5 if mean_cash_flow != 0 else True:
-                recommendation = f"High variability in {sym} purchase shifts; stabilize planning."
-            summaries[sym] = {'mean_cash_flow': mean_cash_flow, 'ci_low': ci_low, 'ci_high': ci_high, 'recommendation': recommendation}
-        
-        scenarios = {
-            'scenarios': {sym: results.tolist() for sym, results in sim_results.items()},
-            'parameters': {'purchase_shift_days': purchase_shift_days},
-            'summary': summaries
-        }
-        serialized_scenarios = json.loads(json.dumps(scenarios, default=convert_to_serializable))
-        return jsonify(serialized_scenarios)
-    except Exception as e:
-        return handle_error(e, '/api/what-if/purchase-schedule')
+def get_what_if_purchase_schedule():
+    return get_what_if_common('purchase_schedule')
 
-# Health-check
 @app.route('/health', methods=['GET'])
 def health_check():
     try:
-        return jsonify({"status": "OK", "banks_supported": len(BANK_SYMBOLS)}), 200
+        log_memory_usage()
+        return jsonify({"status": "OK", "banks_supported": len(BANK_SYMBOLS)})
     except Exception as e:
         return handle_error(e, '/health')
 
+@app.route('/api/chart/cash-flow', methods=['GET'])
+def get_cash_flow_chart():
+    start, end = request.args.get('start'), request.args.get('end')
+    if not start or not end:
+        return jsonify({"error": "Missing start/end"}), 400
+    try:
+        log_memory_usage()
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
+        transactions = pd.DataFrame(data['transactions'])
+        
+        if 'Date' not in transactions.columns or 'Cash Flow' not in transactions.columns:
+            return jsonify({"error": "Required columns (Date, Cash Flow) not found"}), 400
+            
+        # Преобразование даты в строковый формат YYYY-MM-DD
+        transactions['Date'] = pd.to_datetime(transactions['Date']).dt.strftime('%Y-%m-%d')
+        chart_data = transactions.groupby('Date')['Cash Flow'].sum().reset_index()
+        chart_data_json = chart_data.to_json(orient='records')
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Cash Flow Chart</title>
+            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        </head>
+        <body>
+            <canvas id="cashFlowChart" width="400" height="200"></canvas>
+            <script>
+                const ctx = document.getElementById('cashFlowChart').getContext('2d');
+                const chartData = {chart_data_json};
+                new Chart(ctx, {{
+                    type: 'line',
+                    data: {{
+                        labels: chartData.map(row => row.Date),
+                        datasets: [{{
+                            label: 'Cash Flow',
+                            data: chartData.map(row => row['Cash Flow']),
+                            borderColor: 'rgb(75, 192, 192)',
+                            backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                            tension: 0.1
+                        }}]
+                    }},
+                    options: {{
+                        responsive: true,
+                        plugins: {{
+                            title: {{
+                                display: true,
+                                text: 'Cash Flow Over Time'
+                            }}
+                        }},
+                        scales: {{
+                            y: {{ 
+                                beginAtZero: true,
+                                title: {{
+                                    display: true,
+                                    text: 'Amount'
+                                }}
+                            }},
+                            x: {{
+                                title: {{
+                                    display: true,
+                                    text: 'Date'
+                                }}
+                            }}
+                        }}
+                    }}
+                }});
+            </script>
+        </body>
+        </html>
+        """
+        return render_template_string(html)
+    except Exception as e:
+        return handle_error(e, '/api/chart/cash-flow')
+
+@app.route('/api/chart/liquidity', methods=['GET'])
+def get_liquidity_chart():
+    start, end = request.args.get('start'), request.args.get('end')
+    if not start or not end:
+        return jsonify({"error": "Missing start/end"}), 400
+    try:
+        log_memory_usage()
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
+        transactions = pd.DataFrame(data['transactions'])
+        
+        if 'Date' not in transactions.columns or 'Liquidity Ratio' not in transactions.columns:
+            return jsonify({"error": "Required columns (Date, Liquidity Ratio) not found"}), 400
+            
+        # Преобразование даты в строковый формат YYYY-MM-DD
+        transactions['Date'] = pd.to_datetime(transactions['Date']).dt.strftime('%Y-%m-%d')
+        chart_data = transactions.groupby('Date')['Liquidity Ratio'].mean().reset_index()
+        chart_data_json = chart_data.to_json(orient='records')
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Liquidity Chart</title>
+            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        </head>
+        <body>
+            <canvas id="liquidityChart" width="400" height="200"></canvas>
+            <script>
+                const ctx = document.getElementById('liquidityChart').getContext('2d');
+                const chartData = {chart_data_json};
+                new Chart(ctx, {{
+                    type: 'bar',
+                    data: {{
+                        labels: chartData.map(row => row.Date),
+                        datasets: [{{
+                            label: 'Liquidity Ratio',
+                            data: chartData.map(row => row['Liquidity Ratio']),
+                            backgroundColor: 'rgba(54, 162, 235, 0.6)',
+                            borderColor: 'rgba(54, 162, 235, 1)',
+                            borderWidth: 1
+                        }}]
+                    }},
+                    options: {{
+                        responsive: true,
+                        plugins: {{
+                            title: {{
+                                display: true,
+                                text: 'Liquidity Ratio Over Time'
+                            }}
+                        }},
+                        scales: {{
+                            y: {{ 
+                                beginAtZero: true,
+                                title: {{
+                                    display: true,
+                                    text: 'Liquidity Ratio'
+                                }}
+                            }},
+                            x: {{
+                                title: {{
+                                    display: true,
+                                    text: 'Date'
+                                }}
+                            }}
+                        }}
+                    }}
+                }});
+            </script>
+        </body>
+        </html>
+        """
+        return render_template_string(html)
+    except Exception as e:
+        return handle_error(e, '/api/chart/liquidity')
+
+@app.route('/api/chart/account-type-distribution', methods=['GET'])
+def get_account_type_distribution_chart():
+    start, end = request.args.get('start'), request.args.get('end')
+    if not start or not end:
+        return jsonify({"error": "Missing start/end"}), 400
+    try:
+        log_memory_usage()
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
+        transactions = pd.DataFrame(data['transactions'])
+        
+        if 'Account Type' not in transactions.columns or 'Transaction Amount' not in transactions.columns:
+            return jsonify({"error": "Required columns (Account Type, Transaction Amount) not found"}), 400
+            
+        # Этот график не использует Date, поэтому преобразование не требуется
+        chart_data = transactions.groupby('Account Type')['Transaction Amount'].sum().reset_index()
+        chart_data_json = chart_data.to_json(orient='records')
+        
+        # Generate colors dynamically based on number of account types
+        colors = [
+            'rgba(255, 99, 132, 0.6)',
+            'rgba(54, 162, 235, 0.6)', 
+            'rgba(255, 206, 86, 0.6)',
+            'rgba(75, 192, 192, 0.6)',
+            'rgba(153, 102, 255, 0.6)',
+            'rgba(255, 159, 64, 0.6)',
+            'rgba(199, 199, 199, 0.6)',
+            'rgba(83, 102, 255, 0.6)'
+        ]
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Account Type Distribution</title>
+            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        </head>
+        <body>
+            <canvas id="accountTypeChart" width="400" height="200"></canvas>
+            <script>
+                const ctx = document.getElementById('accountTypeChart').getContext('2d');
+                const chartData = {chart_data_json};
+                const colors = {colors};
+                
+                new Chart(ctx, {{
+                    type: 'pie',
+                    data: {{
+                        labels: chartData.map(row => row['Account Type']),
+                        datasets: [{{
+                            label: 'Transaction Amount',
+                            data: chartData.map(row => row['Transaction Amount']),
+                            backgroundColor: colors.slice(0, chartData.length),
+                            borderColor: colors.slice(0, chartData.length).map(color => color.replace('0.6', '1')),
+                            borderWidth: 1
+                        }}]
+                    }},
+                    options: {{
+                        responsive: true,
+                        plugins: {{
+                            title: {{
+                                display: true,
+                                text: 'Transaction Amount by Account Type'
+                            }},
+                            legend: {{
+                                position: 'bottom'
+                            }}
+                        }}
+                    }}
+                }});
+            </script>
+        </body>
+        </html>
+        """
+        return render_template_string(html)
+    except Exception as e:
+        return handle_error(e, '/api/chart/account-type-distribution')
+
 if __name__ == "__main__":
-    # Для локального запуска
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
