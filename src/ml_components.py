@@ -5,11 +5,12 @@ import os
 import sys
 import logging
 from flask import Flask, request, jsonify, render_template_string
+from flask_cors import CORS  # Import Flask-CORS
 from typing import Dict
 from datetime import datetime, timedelta
 import traceback
 import psutil
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 # Настройка базы данных
 DB_URL = "postgresql://postgres.zolipjvrqejnhbendclq:fLXxkf42l6NtY@aws-1-eu-north-1.pooler.supabase.com:6543/postgres"
@@ -34,7 +35,7 @@ try:
     from Datacollector import collect_integrated_data, calculate_liquidity_metrics, BANK_SYMBOLS
 except ImportError as e:
     logger.error(f"Import error: {e}. Ensure Datacollector.py is in the src directory.")
-    def collect_integrated_data(start_date, end_date, account_type=None, symbol=None, real_time=False):
+    def collect_integrated_data(start_date, end_date, account_type=None, symbol=None, real_time=False, table_name=None):
         raise ImportError("Datacollector not available.")
     def calculate_liquidity_metrics(transactions):
         return {'Liquidity Ratio': 0.0, 'status': 'Import error', 'recommendation': 'Fix Datacollector import.'}
@@ -42,11 +43,32 @@ except ImportError as e:
 
 app = Flask(__name__)
 
+# Enable CORS for your frontend origin
+CORS(app, resources={r"/api/*": {"origins": "https://financial-assistant-vite.vercel.app"}})
+
 # Логирование памяти
 def log_memory_usage():
     process = psutil.Process(os.getpid())
     memory_usage = process.memory_info().rss / 1024 / 1024
     logger.info(f"Memory usage: {memory_usage:.2f} MB")
+
+# Required columns for dataset validation
+REQUIRED_COLUMNS = [
+    'Transaction ID', 'Date', 'Account Type', 'Transaction Amount', 'Cash Flow',
+    'Net Income', 'Revenue', 'Expenditure', 'Profit Margin', 'Debt-to-Equity Ratio',
+    'Operating Expenses', 'Gross Profit', 'Transaction Volume', 'Processing Time (seconds)',
+    'Accuracy Score', 'Missing Data Indicator', 'Normalized Transaction Amount',
+    'Transaction Outcome', 'Symbol', 'Liquidity Ratio'
+]
+
+def validate_required_columns(transactions: pd.DataFrame) -> bool:
+    missing_columns = [col for col in REQUIRED_COLUMNS if col not in transactions.columns]
+    if missing_columns:
+        return False, f'Missing required columns in dataset: {", ".join(missing_columns)}'
+    return True, None
+
+# Global variable to store the currently selected table
+selected_table = None
 
 # 2. Monte Carlo
 def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 20,
@@ -125,13 +147,50 @@ def get_banks():
     except Exception as e:
         return handle_error(e, '/api/banks')
 
+@app.route('/api/select-table', methods=['POST'])
+def select_table():
+    try:
+        log_memory_usage()
+        data = request.get_json()
+        if not data or 'table' not in data:
+            return jsonify({'error': 'No table name provided in request body'}), 400
+        table_name = data['table']
+        if not table_name:
+            return jsonify({'error': 'Table name cannot be empty'}), 400
+        
+        # Verify table exists in the database
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_type = 'BASE TABLE'
+                AND table_name = :table_name
+            """), {'table_name': table_name})
+            if not result.fetchone():
+                return jsonify({'error': f'Table "{table_name}" does not exist'}), 400
+        
+        global selected_table
+        selected_table = table_name
+        return jsonify({'message': f'Table "{table_name}" selected successfully'})
+    except Exception as e:
+        return handle_error(e, '/api/select-table')
+
 @app.route('/api/data', methods=['GET'])
 def get_data():
     start, end = request.args.get('start'), request.args.get('end')
-    if not start or not end: return jsonify({"error": "Missing start/end"}), 400
+    if not start or not end:
+        return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
+        global selected_table
+        if not selected_table:
+            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
+        transactions = pd.DataFrame(data['transactions'])
+        is_valid, error_msg = validate_required_columns(transactions)
+        if not is_valid:
+            return jsonify({'error': error_msg}), 400
         return jsonify(json.loads(json.dumps(data, default=convert_to_serializable)))
     except Exception as e:
         return handle_error(e, '/api/data')
@@ -139,11 +198,19 @@ def get_data():
 @app.route('/api/liquidity', methods=['GET'])
 def get_liquidity_report():
     start, end = request.args.get('start'), request.args.get('end')
-    if not start or not end: return jsonify({"error": "Missing start/end"}), 400
+    if not start or not end:
+        return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
-        return jsonify(json.loads(json.dumps(calculate_liquidity_metrics(pd.DataFrame(data['transactions'])), default=convert_to_serializable)))
+        global selected_table
+        if not selected_table:
+            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
+        transactions = pd.DataFrame(data['transactions'])
+        is_valid, error_msg = validate_required_columns(transactions)
+        if not is_valid:
+            return jsonify({'error': error_msg}), 400
+        return jsonify(json.loads(json.dumps(calculate_liquidity_metrics(transactions), default=convert_to_serializable)))
     except Exception as e:
         return handle_error(e, '/api/liquidity')
 
@@ -153,8 +220,14 @@ def get_what_if_common(scenario_type: str):
         return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
+        global selected_table
+        if not selected_table:
+            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
         transactions = pd.DataFrame(data['transactions'])
+        is_valid, error_msg = validate_required_columns(transactions)
+        if not is_valid:
+            return jsonify({'error': error_msg}), 400
         try:
             num_simulations = int(request.args.get('num_simulations', 20))
             currency_growth = float(request.args.get('currency_growth', 0.1))
@@ -222,8 +295,14 @@ def get_cash_flow_chart():
         return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
+        global selected_table
+        if not selected_table:
+            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
         transactions = pd.DataFrame(data['transactions'])
+        is_valid, error_msg = validate_required_columns(transactions)
+        if not is_valid:
+            return jsonify({'error': error_msg}), 400
         
         if 'Date' not in transactions.columns or 'Cash Flow' not in transactions.columns:
             return jsonify({"error": "Required columns (Date, Cash Flow) not found"}), 400
@@ -297,8 +376,14 @@ def get_liquidity_chart():
         return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
+        global selected_table
+        if not selected_table:
+            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
         transactions = pd.DataFrame(data['transactions'])
+        is_valid, error_msg = validate_required_columns(transactions)
+        if not is_valid:
+            return jsonify({'error': error_msg}), 400
         
         if 'Date' not in transactions.columns or 'Liquidity Ratio' not in transactions.columns:
             return jsonify({"error": "Required columns (Date, Liquidity Ratio) not found"}), 400
@@ -372,8 +457,14 @@ def get_account_type_distribution_chart():
         return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
+        global selected_table
+        if not selected_table:
+            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
         transactions = pd.DataFrame(data['transactions'])
+        is_valid, error_msg = validate_required_columns(transactions)
+        if not is_valid:
+            return jsonify({'error': error_msg}), 400
         
         if 'Account Type' not in transactions.columns or 'Transaction Amount' not in transactions.columns:
             return jsonify({"error": "Required columns (Account Type, Transaction Amount) not found"}), 400
@@ -440,6 +531,47 @@ def get_account_type_distribution_chart():
         return render_template_string(html)
     except Exception as e:
         return handle_error(e, '/api/chart/account-type-distribution')
+
+@app.route('/api/tables', methods=['GET'])
+def get_tables():
+    try:
+        log_memory_usage()
+        with engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public' 
+                AND table_type = 'BASE TABLE'
+            """))
+            tables = [row[0] for row in result.fetchall()]
+        return jsonify({'tables': tables, 'selected_table': selected_table})
+    except Exception as e:
+        return handle_error(e, '/api/tables')
+
+@app.route('/api/upload-csv', methods=['POST'])
+def upload_csv():
+    try:
+        log_memory_usage()
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file part'}), 400
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No selected file'}), 400
+        if file and file.filename.lower().endswith('.csv'):
+            df = pd.read_csv(file)
+            table_name = 'uploaded_csv_data'
+            # Drop table if exists to overwrite
+            with engine.connect() as conn:
+                conn.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
+                conn.commit()  # Ensure the DROP TABLE is committed
+            df.to_sql(table_name, engine, index=False, if_exists='replace')
+            global selected_table
+            selected_table = table_name  # Automatically select the uploaded table
+            return jsonify({'message': f'CSV uploaded and saved to table "{table_name}" successfully', 'selected_table': selected_table})
+        else:
+            return jsonify({'error': 'Invalid file type. Only .csv files are allowed'}), 400
+    except Exception as e:
+        return handle_error(e, '/api/upload-csv')
 
 if __name__ == "__main__":
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
