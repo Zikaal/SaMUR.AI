@@ -35,7 +35,7 @@ try:
     from Datacollector import collect_integrated_data, calculate_liquidity_metrics, BANK_SYMBOLS
 except ImportError as e:
     logger.error(f"Import error: {e}. Ensure Datacollector.py is in the src directory.")
-    def collect_integrated_data(start_date, end_date, account_type=None, symbol=None, real_time=False, table_name=None):
+    def collect_integrated_data(start_date, end_date, account_type=None, symbol=None, real_time=False):
         raise ImportError("Datacollector not available.")
     def calculate_liquidity_metrics(transactions):
         return {'Liquidity Ratio': 0.0, 'status': 'Import error', 'recommendation': 'Fix Datacollector import.'}
@@ -66,9 +66,6 @@ def validate_required_columns(transactions: pd.DataFrame) -> bool:
     if missing_columns:
         return False, f'Missing required columns in dataset: {", ".join(missing_columns)}'
     return True, None
-
-# Global variable to store the currently selected table
-selected_table = None
 
 # 2. Monte Carlo
 def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 20,
@@ -147,46 +144,13 @@ def get_banks():
     except Exception as e:
         return handle_error(e, '/api/banks')
 
-@app.route('/api/select-table', methods=['POST'])
-def select_table():
-    try:
-        log_memory_usage()
-        data = request.get_json()
-        if not data or 'table' not in data:
-            return jsonify({'error': 'No table name provided in request body'}), 400
-        table_name = data['table']
-        if not table_name:
-            return jsonify({'error': 'Table name cannot be empty'}), 400
-        
-        # Verify table exists in the database
-        with engine.connect() as conn:
-            result = conn.execute(text("""
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public' 
-                AND table_type = 'BASE TABLE'
-                AND table_name = :table_name
-            """), {'table_name': table_name})
-            if not result.fetchone():
-                return jsonify({'error': f'Table "{table_name}" does not exist'}), 400
-        
-        global selected_table
-        selected_table = table_name
-        return jsonify({'message': f'Table "{table_name}" selected successfully'})
-    except Exception as e:
-        return handle_error(e, '/api/select-table')
-
 @app.route('/api/data', methods=['GET'])
 def get_data():
     start, end = request.args.get('start'), request.args.get('end')
-    if not start or not end:
-        return jsonify({"error": "Missing start/end"}), 400
+    if not start or not end: return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        global selected_table
-        if not selected_table:
-            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
         transactions = pd.DataFrame(data['transactions'])
         is_valid, error_msg = validate_required_columns(transactions)
         if not is_valid:
@@ -198,14 +162,10 @@ def get_data():
 @app.route('/api/liquidity', methods=['GET'])
 def get_liquidity_report():
     start, end = request.args.get('start'), request.args.get('end')
-    if not start or not end:
-        return jsonify({"error": "Missing start/end"}), 400
+    if not start or not end: return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        global selected_table
-        if not selected_table:
-            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
         transactions = pd.DataFrame(data['transactions'])
         is_valid, error_msg = validate_required_columns(transactions)
         if not is_valid:
@@ -220,10 +180,7 @@ def get_what_if_common(scenario_type: str):
         return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        global selected_table
-        if not selected_table:
-            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
         transactions = pd.DataFrame(data['transactions'])
         is_valid, error_msg = validate_required_columns(transactions)
         if not is_valid:
@@ -295,10 +252,7 @@ def get_cash_flow_chart():
         return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        global selected_table
-        if not selected_table:
-            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
         transactions = pd.DataFrame(data['transactions'])
         is_valid, error_msg = validate_required_columns(transactions)
         if not is_valid:
@@ -376,10 +330,7 @@ def get_liquidity_chart():
         return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        global selected_table
-        if not selected_table:
-            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
         transactions = pd.DataFrame(data['transactions'])
         is_valid, error_msg = validate_required_columns(transactions)
         if not is_valid:
@@ -457,10 +408,7 @@ def get_account_type_distribution_chart():
         return jsonify({"error": "Missing start/end"}), 400
     try:
         log_memory_usage()
-        global selected_table
-        if not selected_table:
-            return jsonify({'error': 'No table selected. Please select a table using /api/select-table'}), 400
-        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'), table_name=selected_table)
+        data = collect_integrated_data(start, end, request.args.get('account_type'), request.args.get('symbol'))
         transactions = pd.DataFrame(data['transactions'])
         is_valid, error_msg = validate_required_columns(transactions)
         if not is_valid:
@@ -544,7 +492,7 @@ def get_tables():
                 AND table_type = 'BASE TABLE'
             """))
             tables = [row[0] for row in result.fetchall()]
-        return jsonify({'tables': tables, 'selected_table': selected_table})
+        return jsonify({'tables': tables})
     except Exception as e:
         return handle_error(e, '/api/tables')
 
@@ -565,9 +513,7 @@ def upload_csv():
                 conn.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
                 conn.commit()  # Ensure the DROP TABLE is committed
             df.to_sql(table_name, engine, index=False, if_exists='replace')
-            global selected_table
-            selected_table = table_name  # Automatically select the uploaded table
-            return jsonify({'message': f'CSV uploaded and saved to table "{table_name}" successfully', 'selected_table': selected_table})
+            return jsonify({'message': f'CSV uploaded and saved to table "{table_name}" successfully'})
         else:
             return jsonify({'error': 'Invalid file type. Only .csv files are allowed'}), 400
     except Exception as e:
