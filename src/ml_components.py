@@ -7,11 +7,23 @@ from sklearn.metrics import mean_absolute_error, f1_score
 import json
 import os
 import sys
+import logging
 from flask import Flask, request, jsonify
 from typing import Dict, Any
 from datetime import datetime, timedelta
 import math  # Для обработки inf/NaN
 import traceback  # Для детальных ошибок
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('app.log'),  # Логи в файл app.log
+        logging.StreamHandler()  # Логи в консоль
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # Добавляем src в sys.path, если запускаем из корня
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -20,7 +32,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 try:
     from Datacollector import collect_integrated_data, calculate_liquidity_metrics, BANK_SYMBOLS
 except ImportError as e:
-    print(f"Import error: {e}. Ensure Datacollector.py is in the same directory.")
+    logger.error(f"Import error: {e}. Ensure Datacollector.py is in the same directory.")
     # Fallback: Определим заглушки
     def collect_integrated_data(start_date, end_date, account_type=None, symbol=None, real_time=False):
         raise ImportError("Datacollector not available.")
@@ -77,10 +89,11 @@ def train_prophet_model(transactions: pd.DataFrame, symbol: str = None) -> Dict[
             raise ValueError("No valid models trained.")
         return models
     except Exception as e:
-        raise Exception(f"Error training Prophet model: {str(e)}")
+        logger.error(f"Error training Prophet model: {str(e)} - Traceback: {traceback.format_exc()}")
+        raise
 
 # 2. Сценарии "what-if" (Monte Carlo, per-symbol)
-def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 2000, 
+def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 500,  # Ограничено для скорости
                            currency_growth: float = 0.1, currency_std: float = 0.01, 
                            delay_factor: float = 0.05, purchase_shift_days: int = 0,
                            scenario_type: str = 'all', symbol: str = None) -> Dict[str, pd.Series]:
@@ -108,7 +121,8 @@ def monte_carlo_simulation(transactions: pd.DataFrame, num_simulations: int = 20
             raise ValueError("No simulations run.")
         return results
     except Exception as e:
-        raise Exception(f"Error in Monte Carlo simulation: {str(e)}")
+        logger.error(f"Error in Monte Carlo simulation: {str(e)} - Traceback: {traceback.format_exc()}")
+        raise
 
 def _run_monte_carlo(transactions: pd.DataFrame, num_simulations: int, currency_growth: float, currency_std: float, 
                      delay_factor: float, purchase_shift_days: int, scenario_type: str) -> pd.Series:
@@ -120,7 +134,7 @@ def _run_monte_carlo(transactions: pd.DataFrame, num_simulations: int, currency_
     for _ in range(num_simulations):
         sim_transactions = transactions.copy()
         if scenario_type in ['all', 'currency_growth']:
-            simulated_rate = max(usd_rate * (1 + np.random.normal(currency_growth, currency_std)), 0.01)  # Избегаем нуля
+            simulated_rate = max(usd_rate * (1 + np.random.normal(currency_growth, currency_std)), 0.01)
             sim_transactions['USD_Equivalent'] = sim_transactions['Transaction Amount'] / simulated_rate
             sim_transactions['Cash Flow'] /= simulated_rate
             sim_transactions['Liquidity Ratio'] *= simulated_rate
@@ -168,7 +182,8 @@ def train_recommendation_model(transactions: pd.DataFrame, symbol: str = None) -
             raise ValueError("No valid models trained.")
         return models
     except Exception as e:
-        raise Exception(f"Error training Decision Tree model: {str(e)}")
+        logger.error(f"Error training Decision Tree model: {str(e)} - Traceback: {traceback.format_exc()}")
+        raise
 
 # 4. Измерьте метрики (per-symbol)
 def evaluate_models(prophet_models: Dict[str, Prophet], transactions: pd.DataFrame, rec_models: Dict[str, DecisionTreeClassifier], symbol: str = None) -> Dict[str, Any]:
@@ -219,6 +234,7 @@ def evaluate_models(prophet_models: Dict[str, Prophet], transactions: pd.DataFra
                               'recommendation': recommendation}}
         return {**metrics, **overall}
     except Exception as e:
+        logger.error(f"Error evaluating models: {str(e)} - Traceback: {traceback.format_exc()}")
         return {'overall': {'avg_MAE': 0.0, 'avg_F1': 0.0, 'recommendation': f"Error evaluating models: {str(e)}"}}
 
 # Вспомогательная функция для сериализации
@@ -243,6 +259,7 @@ def convert_to_serializable(obj):
 
 # Обработка ошибок в эндпоинтах
 def handle_error(e, endpoint_name):
+    logger.error(f"Error in {endpoint_name}: {str(e)} - Traceback: {traceback.format_exc()}")
     error_details = {
         'error': str(e),
         'endpoint': endpoint_name,
@@ -253,7 +270,10 @@ def handle_error(e, endpoint_name):
 # Эндпоинт: Список банков
 @app.route('/api/banks', methods=['GET'])
 def get_banks():
-    return jsonify({'banks': BANK_SYMBOLS})
+    try:
+        return jsonify({'banks': BANK_SYMBOLS})
+    except Exception as e:
+        return handle_error(e, '/api/banks')
 
 # Эндпоинт: Получение данных
 @app.route('/api/data', methods=['GET'])
@@ -286,16 +306,25 @@ def get_metrics():
     
     try:
         data = collect_integrated_data(start, end, account_type, symbol)
+        if 'transactions' not in data or not data['transactions']:
+            raise ValueError("No transactions in data")
         transactions = pd.DataFrame(data['transactions'])
         if transactions.empty:
-            raise ValueError("No transaction data available.")
-        prophet_models = train_prophet_model(transactions, symbol)
-        rec_models = train_recommendation_model(transactions, symbol)
-        if not prophet_models or not rec_models:
-            raise ValueError("Model training failed for all symbols.")
+            raise ValueError("Empty transactions DataFrame")
+        required_cols = ['Cash Flow', 'Symbol', 'Liquidity Ratio']
+        missing_cols = [col for col in required_cols if col not in transactions.columns]
+        if missing_cols:
+            raise ValueError(f"Missing columns: {missing_cols}")
+        
+        prophet_models = train_prophet_model(transactions, symbol) or {}
+        rec_models = train_recommendation_model(transactions, symbol) or {}
+        if not prophet_models:
+            raise ValueError("Failed to train Prophet model")
         metrics = evaluate_models(prophet_models, transactions, rec_models, symbol)
         serialized_metrics = json.loads(json.dumps(metrics, default=convert_to_serializable))
         return jsonify(serialized_metrics)
+    except ValueError as ve:
+        return jsonify({"error": f"Value error: {str(ve)}"}), 400
     except Exception as e:
         return handle_error(e, '/api/metrics')
 
@@ -322,8 +351,8 @@ def get_liquidity_report():
 
 @app.route('/api/liquidity/real-time', methods=['GET'])
 def get_real_time_liquidity():
-    current_time = datetime.now() + timedelta(hours=5)  # +05
-    end = current_time.strftime('%Y-%m-%d')  # 2025-09-19
+    current_time = datetime.now() + timedelta(hours=5)  # 12:12 PM +05, 2025-09-19
+    end = current_time.strftime('%Y-%m-%d')
     start = (current_time - timedelta(days=1)).strftime('%Y-%m-%d')
     account_type = request.args.get('account_type')
     symbol = request.args.get('symbol')
@@ -350,16 +379,18 @@ def get_what_if_scenarios():
     currency_std = float(request.args.get('currency_std', 0.01))
     delay_factor = float(request.args.get('delay_factor', 0.05))
     purchase_shift_days = int(request.args.get('purchase_shift_days', 0))
-    num_simulations = int(request.args.get('num_simulations', 2000))
+    num_simulations = int(request.args.get('num_simulations', 500))  # Ограничено для скорости
     
     if not start or not end:
         return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
     
     try:
         data = collect_integrated_data(start, end, account_type, symbol)
+        if 'transactions' not in data or not data['transactions']:
+            raise ValueError("No transactions in data")
         transactions = pd.DataFrame(data['transactions'])
         if transactions.empty:
-            raise ValueError("No transaction data for simulation.")
+            raise ValueError("Empty transactions DataFrame")
         sim_results = monte_carlo_simulation(transactions, num_simulations, currency_growth, currency_std, 
                                              delay_factor, purchase_shift_days, scenario_type='all', symbol=symbol)
         summaries = {}
@@ -397,16 +428,18 @@ def get_currency_growth_scenario():
     symbol = request.args.get('symbol')
     currency_growth = float(request.args.get('currency_growth', 0.1))
     currency_std = float(request.args.get('currency_std', 0.01))
-    num_simulations = int(request.args.get('num_simulations', 2000))
+    num_simulations = int(request.args.get('num_simulations', 500))
     
     if not start or not end:
         return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
     
     try:
         data = collect_integrated_data(start, end, account_type, symbol)
+        if 'transactions' not in data or not data['transactions']:
+            raise ValueError("No transactions in data")
         transactions = pd.DataFrame(data['transactions'])
         if transactions.empty:
-            raise ValueError("No transaction data for simulation.")
+            raise ValueError("Empty transactions DataFrame")
         sim_results = monte_carlo_simulation(transactions, num_simulations, currency_growth, currency_std, 
                                              scenario_type='currency_growth', symbol=symbol)
         summaries = {}
@@ -438,16 +471,18 @@ def get_payment_delay_scenario():
     account_type = request.args.get('account_type')
     symbol = request.args.get('symbol')
     delay_factor = float(request.args.get('delay_factor', 0.05))
-    num_simulations = int(request.args.get('num_simulations', 2000))
+    num_simulations = int(request.args.get('num_simulations', 500))
     
     if not start or not end:
         return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
     
     try:
         data = collect_integrated_data(start, end, account_type, symbol)
+        if 'transactions' not in data or not data['transactions']:
+            raise ValueError("No transactions in data")
         transactions = pd.DataFrame(data['transactions'])
         if transactions.empty:
-            raise ValueError("No transaction data for simulation.")
+            raise ValueError("Empty transactions DataFrame")
         sim_results = monte_carlo_simulation(transactions, num_simulations, delay_factor=delay_factor, 
                                              scenario_type='payment_delay', symbol=symbol)
         summaries = {}
@@ -479,16 +514,18 @@ def get_purchase_schedule_scenario():
     account_type = request.args.get('account_type')
     symbol = request.args.get('symbol')
     purchase_shift_days = int(request.args.get('purchase_shift_days', 0))
-    num_simulations = int(request.args.get('num_simulations', 2000))
+    num_simulations = int(request.args.get('num_simulations', 500))
     
     if not start or not end:
         return jsonify({"error": "Parameters 'start' and 'end' are required"}), 400
     
     try:
         data = collect_integrated_data(start, end, account_type, symbol)
+        if 'transactions' not in data or not data['transactions']:
+            raise ValueError("No transactions in data")
         transactions = pd.DataFrame(data['transactions'])
         if transactions.empty:
-            raise ValueError("No transaction data for simulation.")
+            raise ValueError("Empty transactions DataFrame")
         sim_results = monte_carlo_simulation(transactions, num_simulations, purchase_shift_days=purchase_shift_days, 
                                              scenario_type='purchase_schedule', symbol=symbol)
         summaries = {}
@@ -516,7 +553,10 @@ def get_purchase_schedule_scenario():
 # Health-check
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "OK", "banks_supported": len(BANK_SYMBOLS)}), 200
+    try:
+        return jsonify({"status": "OK", "banks_supported": len(BANK_SYMBOLS)}), 200
+    except Exception as e:
+        return handle_error(e, '/health')
 
 if __name__ == "__main__":
     # Для локального запуска
