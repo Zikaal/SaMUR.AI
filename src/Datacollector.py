@@ -9,6 +9,8 @@ import os
 import math
 from sqlalchemy import create_engine
 
+DB_URL = "postgresql://postgres.zolipjvrqejnhbendclq:fLXxkf42l6NtY@aws-1-eu-north-1.pooler.supabase.com:6543/postgres"
+engine = create_engine(DB_URL)
 
 
 
@@ -260,3 +262,4 @@ if __name__ == "__main__":
     except Exception as e:
 
         print(f"Error: {e}")
+
