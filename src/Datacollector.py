@@ -9,9 +9,8 @@ import os
 import math
 from sqlalchemy import create_engine
 
-# Подключение к Supabase
-DB_URL = "postgresql://postgres.zolipjvrqejnhbendclq:fLXxkf42l6NtY@aws-1-eu-north-1.pooler.supabase.com:6543/postgres"
-engine = create_engine(DB_URL)
+
+
 
 # Список поддерживаемых банков
 BANK_SYMBOLS = ['WFC', 'JPM', 'BAC', 'C', 'USB', 'PNC', 'TFC', 'HBAN', 'FITB', 'RF', 'KEY', 'MTB', 'CFG', 'BBT', 'NUE', 'SBER']
@@ -259,4 +258,5 @@ if __name__ == "__main__":
         print("Data collection successful!")
         print(json.dumps(data, indent=2, default=str))
     except Exception as e:
+
         print(f"Error: {e}")
